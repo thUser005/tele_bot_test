@@ -67,7 +67,6 @@ def get_data_fun(EXPIRY_DATE,UNDERLYING):
     # STEP 1: FETCH HTML
     # =====================================================
     html_url = f"https://groww.in/options/nifty?expiry={EXPIRY_DATE}"
-    print(f"[+] Fetching HTML: {html_url}")
 
     resp = requests.get(html_url, headers=HEADERS_HTML, timeout=15)
     resp.raise_for_status()
@@ -88,20 +87,17 @@ def get_data_fun(EXPIRY_DATE,UNDERLYING):
 
     strikes = sorted(set(normalize_strike(s) for s in strike_texts), key=int)
 
-    print(f"[+] Found {len(strikes)} strikes")
 
     # =====================================================
     # STEP 3: BUILD OPTION SYMBOLS (CORRECT FORMAT)
     # =====================================================
     expiry_code = build_expiry_code(EXPIRY_DATE)
-    print(f"[+] Expiry code used: {expiry_code}")
 
     symbols = []
     for strike in strikes:
         symbols.append(build_symbol(UNDERLYING, expiry_code, strike, "CE"))
         symbols.append(build_symbol(UNDERLYING, expiry_code, strike, "PE"))
 
-    print(f"[+] Generated {len(symbols)} option symbols")
 
     # =====================================================
     # STEP 4: FETCH LIVE PRICES
@@ -113,7 +109,6 @@ def get_data_fun(EXPIRY_DATE,UNDERLYING):
 
     HEADERS_API["referer"] = html_url
 
-    print("[+] Fetching live prices")
 
     response = requests.post(
         api_url,
