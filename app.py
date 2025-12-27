@@ -1,15 +1,22 @@
 import os
 import json
+import re
 import requests
 from datetime import datetime
-from flask import Flask, request
+from flask import Flask, request, Response
 from telegram import Bot, Update
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
+from bs4 import BeautifulSoup
 
 # =====================================================
 # CONFIG
 # =====================================================
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+
+HEADERS_HTML = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
 HEADERS_API = {
     "accept": "application/json, text/plain, */*",
@@ -27,19 +34,11 @@ app = Flask(__name__)
 dispatcher = Dispatcher(bot, None, workers=1)
 
 # =====================================================
-# EXPIRY + SYMBOL HELPERS
+# HELPERS (FROM YOUR WORKING SCRIPT)
 # =====================================================
-def validate_expiry(expiry_date: str):
-    dt = datetime.strptime(expiry_date, "%Y-%m-%d")
-    if dt.weekday() != 3:  # Thursday
-        raise ValueError(
-            f"{expiry_date} is not a valid expiry. "
-            "NIFTY/BANKNIFTY expiry must be Thursday."
-        )
-
 def is_weekly_expiry(expiry_date: str) -> bool:
     dt = datetime.strptime(expiry_date, "%Y-%m-%d")
-    return dt.weekday() != 3
+    return dt.weekday() != 3  # Thursday
 
 def build_expiry_code(expiry_date: str) -> str:
     dt = datetime.strptime(expiry_date, "%Y-%m-%d")
@@ -48,145 +47,103 @@ def build_expiry_code(expiry_date: str) -> str:
     else:
         return dt.strftime("%y%b").upper()
 
+def normalize_strike(text: str) -> str:
+    return text.replace(",", "")
+
 def build_symbol(underlying, expiry_code, strike, opt_type):
     return f"{underlying}{expiry_code}{strike}{opt_type}"
 
-# =====================================================
-# SIGNAL PARSER (TEXT OR JSON)
-# =====================================================
-def parse_signal(text: str):
-    text = text.strip()
-
-    # ---------- JSON FORMAT ----------
-    if text.startswith("{"):
-        data = json.loads(text)
-
-        required = ["action", "underlying", "strike", "option_type", "expiry"]
-        for k in required:
-            if k not in data:
-                raise ValueError(f"Missing field: {k}")
-
-        return {
-            "action": data["action"].upper(),
-            "underlying": data["underlying"].upper(),
-            "strike": int(data["strike"]),
-            "option_type": data["option_type"].upper(),
-            "expiry": data["expiry"],
-            "above": data.get("above"),
-            "targets": data.get("targets", []),
-            "stoploss": data.get("sl"),
-        }
-
-    # ---------- TEXT FORMAT ----------
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    if len(lines) < 5:
-        raise ValueError("Incomplete signal data")
-
-    signal = {
-        "action": lines[0].upper(),
-        "underlying": lines[1].upper(),
-        "strike": int(lines[2]),
-        "option_type": lines[3].upper(),
-        "expiry": datetime.strptime(lines[4], "%d-%m-%Y").strftime("%Y-%m-%d"),
-        "above": None,
-        "targets": [],
-        "stoploss": None,
-    }
-
-    for line in lines[5:]:
-        if line.startswith("ABOVE="):
-            signal["above"] = int(line.split("=")[1])
-        elif line.startswith("TARGETS="):
-            signal["targets"] = [int(x) for x in line.split("=")[1].split(",")]
-        elif line.startswith("SL="):
-            signal["stoploss"] = int(line.split("=")[1])
-
-    return signal
+def validate_expiry(expiry_date: str):
+    dt = datetime.strptime(expiry_date, "%Y-%m-%d")
+    if dt.weekday() != 3:
+        raise ValueError("Expiry must be a Thursday")
 
 # =====================================================
-# FETCH LIVE PRICE
+# CORE: FETCH FULL OPTION CHAIN
 # =====================================================
-def fetch_live_price(symbol, referer_url):
+def fetch_option_chain(expiry_date: str, underlying="NIFTY"):
+    validate_expiry(expiry_date)
+
+    html_url = f"https://groww.in/options/{underlying.lower()}?expiry={expiry_date}"
+
+    # ---- STEP 1: Fetch HTML ----
+    resp = requests.get(html_url, headers=HEADERS_HTML, timeout=15)
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    texts = [i.get_text(strip=True) for i in soup.select(".bodyBaseHeavy")]
+
+    strike_texts = [
+        t for t in texts if re.fullmatch(r"\d{1,3}(,\d{3})*", t)
+    ]
+
+    if not strike_texts:
+        raise RuntimeError("No strikes found")
+
+    strikes = sorted(set(normalize_strike(s) for s in strike_texts), key=int)
+
+    # ---- STEP 2: Build Symbols ----
+    expiry_code = build_expiry_code(expiry_date)
+
+    symbols = []
+    for strike in strikes:
+        symbols.append(build_symbol(underlying, expiry_code, strike, "CE"))
+        symbols.append(build_symbol(underlying, expiry_code, strike, "PE"))
+
+    # ---- STEP 3: Fetch Live Prices ----
     api_url = (
         "https://groww.in/v1/api/stocks_fo_data/v1/"
         "tr_live_prices/exchange/NSE/segment/FNO/latest_prices_batch"
     )
 
     headers = HEADERS_API.copy()
-    headers["referer"] = referer_url
+    headers["referer"] = html_url
 
-    r = requests.post(api_url, headers=headers, json=[symbol], timeout=15)
+    r = requests.post(api_url, headers=headers, json=symbols, timeout=20)
     r.raise_for_status()
-    return r.json().get(symbol)
+
+    return r.json()
 
 # =====================================================
 # /start
 # =====================================================
 def start(update, context):
     update.message.reply_text(
-        "👋 *Welcome to Signal Bot*\n\n"
-        "*Send signal in ANY ONE format below:*\n\n"
-        "*Text format:*\n"
-        "BUY\n"
-        "NIFTY\n"
-        "26200\n"
-        "CE\n"
-        "26-12-2025   ← (Must be Thursday)\n"
-        "ABOVE=45\n"
-        "TARGETS=55,75,85,100\n"
-        "SL=25\n\n"
-        "*OR JSON format:*\n"
-        "{\n"
-        "  \"action\": \"BUY\",\n"
-        "  \"underlying\": \"NIFTY\",\n"
-        "  \"strike\": 26200,\n"
-        "  \"option_type\": \"CE\",\n"
-        "  \"expiry\": \"2025-12-26\",\n"
-        "  \"above\": 45,\n"
-        "  \"targets\": [55,75,85,100],\n"
-        "  \"sl\": 25\n"
-        "}",
+        "📊 *Option Chain Bot*\n\n"
+        "Send:\n"
+        "`DATE YYYY-MM-DD`\n\n"
+        "Example:\n"
+        "`DATE 2026-01-08`\n\n"
+        "⚠️ Date must be a *Thursday*",
         parse_mode="Markdown"
     )
 
 # =====================================================
-# MESSAGE HANDLER (TELEGRAM)
+# TELEGRAM MESSAGE HANDLER
 # =====================================================
 def handle_message(update, context):
     try:
-        signal = parse_signal(update.message.text)
+        text = update.message.text.strip().upper()
 
-        validate_expiry(signal["expiry"])
+        if not text.startswith("DATE"):
+            raise ValueError("Use: DATE YYYY-MM-DD")
 
-        expiry_code = build_expiry_code(signal["expiry"])
-        symbol = build_symbol(
-            signal["underlying"],
-            expiry_code,
-            signal["strike"],
-            signal["option_type"]
-        )
+        expiry = text.split()[1]
 
-        html_url = (
-            f"https://groww.in/options/"
-            f"{signal['underlying'].lower()}?expiry={signal['expiry']}"
-        )
+        data = fetch_option_chain(expiry)
 
-        market_data = fetch_live_price(symbol, html_url)
+        filename = f"data_{expiry}.json"
+        file_bytes = json.dumps(data, indent=2).encode("utf-8")
 
-        update.message.reply_text(
-            json.dumps(
-                {"signal": signal, "market_data": market_data},
-                indent=2
-            )
+        update.message.reply_document(
+            document=file_bytes,
+            filename=filename,
+            caption=f"📄 Option chain for {expiry}"
         )
 
     except Exception as e:
         update.message.reply_text(
-            "❌ *Invalid signal*\n\n"
-            f"Reason: `{e}`\n\n"
-            "Expiry must be a valid Thursday.\n"
-            "Type /start to see the correct format.",
-            parse_mode="Markdown"
+            f"❌ Error:\n{e}\n\nType /start for help"
         )
 
 # =====================================================
@@ -196,72 +153,44 @@ dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
 # =====================================================
-# WEBHOOK (POST = Telegram, GET = API)
+# WEBHOOK (POST = Telegram, GET = Browser/API)
 # =====================================================
 @app.route("/webhook", methods=["POST", "GET"])
 def webhook():
 
-    # -------- Telegram webhook --------
+    # Telegram webhook
     if request.method == "POST":
         update = Update.de_json(request.get_json(force=True), bot)
         dispatcher.process_update(update)
         return "OK", 200
 
-    # -------- URL API trigger --------
+    # Browser/API
     try:
-        signal = {
-            "action": request.args.get("action", "").upper(),
-            "underlying": request.args.get("underlying", "").upper(),
-            "strike": request.args.get("strike", type=int),
-            "option_type": request.args.get("option_type", "").upper(),
-            "expiry": request.args.get("expiry"),
-            "above": request.args.get("above", type=int),
-            "targets": (
-                [int(x) for x in request.args.get("targets", "").split(",")]
-                if request.args.get("targets") else []
-            ),
-            "stoploss": request.args.get("sl", type=int),
-        }
+        expiry = request.args.get("expiry")
+        underlying = request.args.get("underlying", "NIFTY")
 
-        if not all([signal["action"], signal["underlying"],
-                    signal["strike"], signal["option_type"],
-                    signal["expiry"]]):
-            return {"error": "Missing required parameters"}, 400
+        if not expiry:
+            return {"error": "expiry param required"}, 400
 
-        validate_expiry(signal["expiry"])
+        data = fetch_option_chain(expiry, underlying)
 
-        expiry_code = build_expiry_code(signal["expiry"])
-        symbol = build_symbol(
-            signal["underlying"],
-            expiry_code,
-            signal["strike"],
-            signal["option_type"]
+        return Response(
+            json.dumps(data, indent=2),
+            mimetype="application/json",
+            headers={
+                "Content-Disposition": f"attachment; filename=data_{expiry}.json"
+            }
         )
-
-        html_url = (
-            f"https://groww.in/options/"
-            f"{signal['underlying'].lower()}?expiry={signal['expiry']}"
-        )
-
-        market_data = fetch_live_price(symbol, html_url)
-
-        return {
-            "signal": signal,
-            "market_data": market_data
-        }, 200
 
     except Exception as e:
-        return {
-            "error": str(e),
-            "hint": "Use a valid Thursday expiry"
-        }, 400
+        return {"error": str(e)}, 400
 
 # =====================================================
-# HEALTH CHECK
+# HEALTH
 # =====================================================
 @app.route("/")
 def index():
-    return "Telegram Signal Bot Running"
+    return "Option Chain Bot Running"
 
 if __name__ == "__main__":
     app.run(port=8000)
