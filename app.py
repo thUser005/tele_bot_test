@@ -183,11 +183,69 @@ dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_me
 # =====================================================
 # WEBHOOK
 # =====================================================
-@app.route("/webhook", methods=["POST"])
+@app.route("/webhook", methods=["POST", "GET"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
-    return "OK", 200
+    # -------------------------------------------------
+    # CASE 1: Telegram webhook (POST)
+    # -------------------------------------------------
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), bot)
+        dispatcher.process_update(update)
+        return "OK", 200
+
+    # -------------------------------------------------
+    # CASE 2: URL parameter trigger (GET)
+    # -------------------------------------------------
+    try:
+        # Required params
+        action = request.args.get("action")
+        underlying = request.args.get("underlying")
+        strike = request.args.get("strike", type=int)
+        option_type = request.args.get("option_type")
+        expiry = request.args.get("expiry")
+
+        if not all([action, underlying, strike, option_type, expiry]):
+            return {
+                "error": "Missing required parameters",
+                "required": [
+                    "action", "underlying", "strike",
+                    "option_type", "expiry"
+                ]
+            }, 400
+
+        signal = {
+            "action": action.upper(),
+            "underlying": underlying.upper(),
+            "strike": strike,
+            "option_type": option_type.upper(),
+            "expiry": expiry,
+            "above": request.args.get("above", type=int),
+            "targets": (
+                [int(x) for x in request.args.get("targets", "").split(",")]
+                if request.args.get("targets") else []
+            ),
+            "stoploss": request.args.get("sl", type=int),
+        }
+
+        expiry_code = build_expiry_code(signal["expiry"])
+        symbol = build_symbol(
+            signal["underlying"],
+            expiry_code,
+            signal["strike"],
+            signal["option_type"]
+        )
+
+        html_url = f"https://groww.in/options/{signal['underlying'].lower()}?expiry={signal['expiry']}"
+        market_data = fetch_live_price(symbol, html_url)
+
+        return {
+            "signal": signal,
+            "market_data": market_data
+        }, 200
+
+    except Exception as e:
+        return {"error": str(e)}, 500
+
 
 @app.route("/")
 def index():
