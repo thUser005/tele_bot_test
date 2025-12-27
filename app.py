@@ -9,7 +9,7 @@ bot = Bot(token=TOKEN)
 
 app = Flask(__name__)
 
-dispatcher = Dispatcher(bot, None, workers=0)
+dispatcher = Dispatcher(bot, None, workers=1)
 
 # -----------------------------
 # STATE STORAGE (in-memory)
