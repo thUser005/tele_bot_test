@@ -29,6 +29,14 @@ dispatcher = Dispatcher(bot, None, workers=1)
 # =====================================================
 # EXPIRY + SYMBOL HELPERS
 # =====================================================
+def validate_expiry(expiry_date: str):
+    dt = datetime.strptime(expiry_date, "%Y-%m-%d")
+    if dt.weekday() != 3:  # Thursday
+        raise ValueError(
+            f"{expiry_date} is not a valid expiry. "
+            "NIFTY/BANKNIFTY expiry must be Thursday."
+        )
+
 def is_weekly_expiry(expiry_date: str) -> bool:
     dt = datetime.strptime(expiry_date, "%Y-%m-%d")
     return dt.weekday() != 3
@@ -74,12 +82,16 @@ def parse_signal(text: str):
     if len(lines) < 5:
         raise ValueError("Incomplete signal data")
 
-    signal = {}
-    signal["action"] = lines[0].upper()
-    signal["underlying"] = lines[1].upper()
-    signal["strike"] = int(lines[2])
-    signal["option_type"] = lines[3].upper()
-    signal["expiry"] = datetime.strptime(lines[4], "%d-%m-%Y").strftime("%Y-%m-%d")
+    signal = {
+        "action": lines[0].upper(),
+        "underlying": lines[1].upper(),
+        "strike": int(lines[2]),
+        "option_type": lines[3].upper(),
+        "expiry": datetime.strptime(lines[4], "%d-%m-%Y").strftime("%Y-%m-%d"),
+        "above": None,
+        "targets": [],
+        "stoploss": None,
+    }
 
     for line in lines[5:]:
         if line.startswith("ABOVE="):
@@ -88,10 +100,6 @@ def parse_signal(text: str):
             signal["targets"] = [int(x) for x in line.split("=")[1].split(",")]
         elif line.startswith("SL="):
             signal["stoploss"] = int(line.split("=")[1])
-
-    signal.setdefault("targets", [])
-    signal.setdefault("above", None)
-    signal.setdefault("stoploss", None)
 
     return signal
 
@@ -123,7 +131,7 @@ def start(update, context):
         "NIFTY\n"
         "26200\n"
         "CE\n"
-        "30-12-2025\n"
+        "26-12-2025   ← (Must be Thursday)\n"
         "ABOVE=45\n"
         "TARGETS=55,75,85,100\n"
         "SL=25\n\n"
@@ -133,7 +141,7 @@ def start(update, context):
         "  \"underlying\": \"NIFTY\",\n"
         "  \"strike\": 26200,\n"
         "  \"option_type\": \"CE\",\n"
-        "  \"expiry\": \"2025-12-30\",\n"
+        "  \"expiry\": \"2025-12-26\",\n"
         "  \"above\": 45,\n"
         "  \"targets\": [55,75,85,100],\n"
         "  \"sl\": 25\n"
@@ -142,11 +150,13 @@ def start(update, context):
     )
 
 # =====================================================
-# MESSAGE HANDLER
+# MESSAGE HANDLER (TELEGRAM)
 # =====================================================
 def handle_message(update, context):
     try:
         signal = parse_signal(update.message.text)
+
+        validate_expiry(signal["expiry"])
 
         expiry_code = build_expiry_code(signal["expiry"])
         symbol = build_symbol(
@@ -156,7 +166,11 @@ def handle_message(update, context):
             signal["option_type"]
         )
 
-        html_url = f"https://groww.in/options/{signal['underlying'].lower()}?expiry={signal['expiry']}"
+        html_url = (
+            f"https://groww.in/options/"
+            f"{signal['underlying'].lower()}?expiry={signal['expiry']}"
+        )
+
         market_data = fetch_live_price(symbol, html_url)
 
         update.message.reply_text(
@@ -168,8 +182,9 @@ def handle_message(update, context):
 
     except Exception as e:
         update.message.reply_text(
-            "❌ *Invalid input format*\n\n"
+            "❌ *Invalid signal*\n\n"
             f"Reason: `{e}`\n\n"
+            "Expiry must be a valid Thursday.\n"
             "Type /start to see the correct format.",
             parse_mode="Markdown"
         )
@@ -181,44 +196,25 @@ dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
 # =====================================================
-# WEBHOOK
+# WEBHOOK (POST = Telegram, GET = API)
 # =====================================================
 @app.route("/webhook", methods=["POST", "GET"])
 def webhook():
-    # -------------------------------------------------
-    # CASE 1: Telegram webhook (POST)
-    # -------------------------------------------------
+
+    # -------- Telegram webhook --------
     if request.method == "POST":
         update = Update.de_json(request.get_json(force=True), bot)
         dispatcher.process_update(update)
         return "OK", 200
 
-    # -------------------------------------------------
-    # CASE 2: URL parameter trigger (GET)
-    # -------------------------------------------------
+    # -------- URL API trigger --------
     try:
-        # Required params
-        action = request.args.get("action")
-        underlying = request.args.get("underlying")
-        strike = request.args.get("strike", type=int)
-        option_type = request.args.get("option_type")
-        expiry = request.args.get("expiry")
-
-        if not all([action, underlying, strike, option_type, expiry]):
-            return {
-                "error": "Missing required parameters",
-                "required": [
-                    "action", "underlying", "strike",
-                    "option_type", "expiry"
-                ]
-            }, 400
-
         signal = {
-            "action": action.upper(),
-            "underlying": underlying.upper(),
-            "strike": strike,
-            "option_type": option_type.upper(),
-            "expiry": expiry,
+            "action": request.args.get("action", "").upper(),
+            "underlying": request.args.get("underlying", "").upper(),
+            "strike": request.args.get("strike", type=int),
+            "option_type": request.args.get("option_type", "").upper(),
+            "expiry": request.args.get("expiry"),
             "above": request.args.get("above", type=int),
             "targets": (
                 [int(x) for x in request.args.get("targets", "").split(",")]
@@ -226,6 +222,13 @@ def webhook():
             ),
             "stoploss": request.args.get("sl", type=int),
         }
+
+        if not all([signal["action"], signal["underlying"],
+                    signal["strike"], signal["option_type"],
+                    signal["expiry"]]):
+            return {"error": "Missing required parameters"}, 400
+
+        validate_expiry(signal["expiry"])
 
         expiry_code = build_expiry_code(signal["expiry"])
         symbol = build_symbol(
@@ -235,7 +238,11 @@ def webhook():
             signal["option_type"]
         )
 
-        html_url = f"https://groww.in/options/{signal['underlying'].lower()}?expiry={signal['expiry']}"
+        html_url = (
+            f"https://groww.in/options/"
+            f"{signal['underlying'].lower()}?expiry={signal['expiry']}"
+        )
+
         market_data = fetch_live_price(symbol, html_url)
 
         return {
@@ -244,9 +251,14 @@ def webhook():
         }, 200
 
     except Exception as e:
-        return {"error": str(e)}, 500
+        return {
+            "error": str(e),
+            "hint": "Use a valid Thursday expiry"
+        }, 400
 
-
+# =====================================================
+# HEALTH CHECK
+# =====================================================
 @app.route("/")
 def index():
     return "Telegram Signal Bot Running"
