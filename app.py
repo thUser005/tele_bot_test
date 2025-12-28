@@ -100,10 +100,13 @@ def safe_send(chat_id, text, **kw):
 # =====================================================
 def build_option_symbol_from_human(text):
     """
+    Unified expiry format for ALL indices:
+    <UNDERLYING><YY><M><DD><STRIKE><CE|PE>
+
     Examples:
-    SENSEX 18 OCT 84400 PE  -> SENSEX2610184400PE
-    BANKEX 18 OCT 44500 CE  -> BANKEX26101844500CE
-    NIFTY 25 JAN 25950 CE   -> NIFTY26JAN25950CE
+    SENSEX 01 JAN 85400 PE -> SENSEX26010185400PE
+    NIFTY 02 FEB 25950 CE  -> NIFTY262025950CE
+    BANKNIFTY 18 OCT 44500 PE -> BANKNIFTY26101844500PE
     """
 
     parts = text.split()
@@ -117,21 +120,21 @@ def build_option_symbol_from_human(text):
     if opt not in ("CE", "PE"):
         return None
 
+    try:
+        day = int(day)
+        month_num = datetime.strptime(mon, "%b").month
+    except ValueError:
+        return None
+
     today = datetime.now(IST)
     year = today.year % 100
-    month_num = datetime.strptime(mon, "%b").month
-    day = int(day)
 
     # roll year if expiry month already passed
     if month_num < today.month:
         year += 1
 
-    # 🔥 BSE indices use YYMMDD
-    if underlying in ("SENSEX", "BANKEX"):
-        return f"{underlying}{year:02d}{month_num:02d}{day:02d}{strike}{opt}"
-
-    # 🔥 NSE indices use YYMON
-    return f"{underlying}{year:02d}{mon}{strike}{opt}"
+    # ✅ SAME FORMAT FOR NSE + BSE
+    return f"{underlying}{year:02d}{month_num}{day:02d}{strike}{opt}"
 
 # =====================================================
 # MONITOR THREAD
