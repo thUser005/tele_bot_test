@@ -1,12 +1,11 @@
 import os
-import json
 import time
 import threading
 import traceback
 import requests
 from datetime import datetime, timedelta, timezone
 
-from flask import Flask, request, Response
+from flask import Flask, request
 from telegram import Bot, Update
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
 from telegram.utils.request import Request
@@ -21,8 +20,6 @@ if not TOKEN:
 CAPITAL = 20_000
 RISK_PCT = 0.01
 RISK_AMOUNT = CAPITAL * RISK_PCT
-
-ALERT_INTERVAL_SECONDS = 60 * 60
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -53,21 +50,23 @@ HEADERS = {
     "x-platform": "web",
 }
 
-
+# =====================================================
+# TIME / UTIL
+# =====================================================
 def now_millis():
     return int(datetime.now(IST).timestamp() * 1000)
 
 
 def detect_underlying(symbol: str):
-    for key in LOT_SIZES:
-        if symbol.startswith(key):
-            return key
+    for k in LOT_SIZES:
+        if symbol.startswith(k):
+            return k
     return "NIFTY"
 
 
-def fetch_option_ltp(symbol: str, exchange="NSE"):
+def fetch_option_ltp(symbol: str, exchange: str):
     end_ms = now_millis()
-    start_ms = end_ms - (5 * 60 * 1000)
+    start_ms = end_ms - 5 * 60 * 1000
 
     url = (
         f"{BASE_CHART_URL}/exchange/{exchange}/segment/FNO/{symbol}"
@@ -78,20 +77,48 @@ def fetch_option_ltp(symbol: str, exchange="NSE"):
 
     r = requests.get(url, headers=HEADERS, timeout=5)
     r.raise_for_status()
-    data = r.json()
 
-    candles = data.get("candles", [])
-    if not candles:
+    candles = r.json().get("candles", [])
+    return candles[-1][4] if candles else None
+
+
+# =====================================================
+# HUMAN OPTION FORMAT PARSER
+# =====================================================
+def build_option_symbol_from_human(text: str):
+    """
+    Converts:
+    SENSEX 01 JAN 85400 PE
+    → SENSEX26JAN85400PE
+    """
+    parts = text.split()
+    if len(parts) != 5:
         return None
 
-    return candles[-1][4]  # close price
+    underlying, day, mon, strike, opt = parts
+    mon = mon.upper()
+    opt = opt.upper()
+
+    if opt not in ("CE", "PE"):
+        return None
+
+    today = datetime.now(IST)
+    year = today.year % 100
+    month_num = datetime.strptime(mon, "%b").month
+
+    if month_num < today.month:
+        year += 1
+
+    return f"{underlying}{year:02d}{mon}{strike}{opt}"
 
 
 # =====================================================
-# TELEGRAM BOT
+# TELEGRAM BOT INIT
 # =====================================================
-tg_request = Request(con_pool_size=8, connect_timeout=5, read_timeout=5)
-bot = Bot(token=TOKEN, request=tg_request)
+bot = Bot(
+    token=TOKEN,
+    request=Request(con_pool_size=8, connect_timeout=5, read_timeout=5),
+)
 
 app = Flask(__name__)
 dispatcher = Dispatcher(bot, None, workers=1)
@@ -105,15 +132,15 @@ price_watchers = {}
 # =====================================================
 # SAFE SEND
 # =====================================================
-def safe_send(chat_id, text, **kwargs):
+def safe_send(chat_id, text, **kw):
     try:
-        bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        bot.send_message(chat_id, text, **kw)
     except Exception as e:
         print("⚠️ Telegram error:", e)
 
 
 # =====================================================
-# PRICE MONITOR WORKER
+# PRICE MONITOR THREAD
 # =====================================================
 def price_monitor_worker(chat_id, user_id, symbol, entry_price):
     try:
@@ -137,7 +164,7 @@ def price_monitor_worker(chat_id, user_id, symbol, entry_price):
             if ltp >= entry_price:
                 risk_per_lot = ltp * lot_size
                 max_risk_lots = int(RISK_AMOUNT // risk_per_lot)
-                max_capital_lots = int(CAPITAL // (ltp * lot_size))
+                max_capital_lots = int(CAPITAL // risk_per_lot)
                 final_lots = max(0, min(max_risk_lots, max_capital_lots))
 
                 safe_send(
@@ -171,17 +198,15 @@ def price_monitor_worker(chat_id, user_id, symbol, entry_price):
 # /start
 # =====================================================
 def start(update, context):
-    user_id = update.effective_user.id
-    user_state[user_id] = {"mode": None}
+    user_state[update.effective_user.id] = {"mode": None}
 
     safe_send(
         update.effective_chat.id,
         "👋 *Welcome*\n\n"
-        "1️⃣ Option Chain by Date\n"
-        "2️⃣ Add Two Numbers\n"
-        "3️⃣ Bot Health Alerts\n"
-        "4️⃣ Monitor Option Price\n\n"
-        "Reply with *1–4*",
+        "1️⃣ Add Two Numbers\n"
+        "2️⃣ Bot Health Alerts\n"
+        "3️⃣ Monitor Option Price\n\n"
+        "Reply with *1–3*",
         parse_mode="Markdown"
     )
 
@@ -194,56 +219,69 @@ dispatcher.add_handler(CommandHandler("start", start))
 # =====================================================
 def handle_message(update, context):
     try:
-        user_id = update.effective_user.id
-        chat_id = update.effective_chat.id
-        text = update.message.text.strip().upper()
+        uid = update.effective_user.id
+        cid = update.effective_chat.id
+        txt = update.message.text.strip().upper()
 
-        if user_id not in user_state:
-            safe_send(chat_id, "Type /start")
+        if uid not in user_state:
+            safe_send(cid, "Type /start")
             return
 
-        state = user_state[user_id]
+        state = user_state[uid]
 
         # MENU
         if state["mode"] is None:
-            if text == "4":
+            if txt == "3":
                 state["mode"] = "MONITOR"
                 state["step"] = 1
-                safe_send(chat_id, "Send:\n`OPTION NIFTY25DEC25950CE`", parse_mode="Markdown")
+                safe_send(cid, "Send:\n`OPTION NIFTY25DEC25950CE`\nOR\n`OPTION SENSEX 01 JAN 85400 PE`",
+                          parse_mode="Markdown")
                 return
 
-            safe_send(chat_id, "Select option 4 for monitoring")
+            safe_send(cid, "Only option *3* is active now", parse_mode="Markdown")
             return
 
         # MONITOR MODE
         if state["mode"] == "MONITOR":
             if state["step"] == 1:
-                if not text.startswith("OPTION"):
-                    safe_send(chat_id, "Use:\nOPTION SYMBOL")
+                if not txt.startswith("OPTION"):
+                    safe_send(cid, "Use:\nOPTION SYMBOL")
                     return
-                state["symbol"] = text.split()[1]
+
+                raw = txt.replace("OPTION", "").strip()
+
+                if raw[-2:] in ("CE", "PE") and any(c.isdigit() for c in raw):
+                    symbol = raw
+                else:
+                    symbol = build_option_symbol_from_human(raw)
+
+                if not symbol:
+                    safe_send(cid, "❌ Invalid option format")
+                    return
+
+                state["symbol"] = symbol
                 state["step"] = 2
-                safe_send(chat_id, "Send:\n`PRICE 120.5`", parse_mode="Markdown")
+                safe_send(cid, "Send:\n`PRICE 120.5`", parse_mode="Markdown")
                 return
 
             if state["step"] == 2:
-                if not text.startswith("PRICE"):
-                    safe_send(chat_id, "Use:\nPRICE 120.5")
+                if not txt.startswith("PRICE"):
+                    safe_send(cid, "Use:\nPRICE 120.5")
                     return
 
-                entry_price = float(text.split()[1])
+                entry_price = float(txt.split()[1])
                 symbol = state["symbol"]
 
                 stop_event = threading.Event()
-                price_watchers[user_id] = stop_event
+                price_watchers[uid] = stop_event
 
                 threading.Thread(
                     target=price_monitor_worker,
-                    args=(chat_id, user_id, symbol, entry_price),
+                    args=(cid, uid, symbol, entry_price),
                     daemon=True
                 ).start()
 
-                user_state[user_id] = {"mode": None}
+                user_state[uid] = {"mode": None}
                 return
 
     except Exception:
@@ -254,7 +292,7 @@ dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_me
 
 
 # =====================================================
-# WEBHOOK
+# WEBHOOK / HEALTH
 # =====================================================
 @app.route("/webhook", methods=["POST"])
 def webhook():
