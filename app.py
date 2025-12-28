@@ -1,7 +1,6 @@
 import os
 import time
 import threading
-import traceback
 import requests
 from datetime import datetime, timedelta, timezone
 
@@ -36,7 +35,7 @@ LOT_SIZES = {
 }
 
 # =====================================================
-# GROWW CHART API
+# GROWW API
 # =====================================================
 BASE_CHART_URL = (
     "https://groww.in/v1/api/stocks_fo_data/v1/"
@@ -51,7 +50,7 @@ HEADERS = {
 }
 
 # =====================================================
-# FLASK / TELEGRAM INIT
+# INIT
 # =====================================================
 bot = Bot(
     token=TOKEN,
@@ -66,7 +65,7 @@ dispatcher = Dispatcher(bot, None, workers=1)
 # =====================================================
 user_state = {}
 price_watchers = {}
-active_monitors = {}   # 🔥 live dashboard data
+active_monitors = {}
 
 # =====================================================
 # UTIL
@@ -75,14 +74,14 @@ def now_millis():
     return int(datetime.now(IST).timestamp() * 1000)
 
 
-def detect_underlying(symbol: str):
+def detect_underlying(symbol):
     for k in LOT_SIZES:
         if symbol.startswith(k):
             return k
     return "NIFTY"
 
 
-def fetch_option_ltp(symbol: str, exchange: str):
+def fetch_option_ltp(symbol, exchange):
     end_ms = now_millis()
     start_ms = end_ms - 5 * 60 * 1000
 
@@ -103,13 +102,13 @@ def safe_send(chat_id, text, **kw):
     try:
         bot.send_message(chat_id, text, **kw)
     except Exception as e:
-        print("⚠️ Telegram error:", e)
+        print("Telegram error:", e)
 
 
 # =====================================================
-# HUMAN OPTION FORMAT PARSER
+# OPTION PARSER
 # =====================================================
-def build_option_symbol_from_human(text: str):
+def build_option_symbol_from_human(text):
     parts = text.split()
     if len(parts) != 5:
         return None
@@ -123,91 +122,65 @@ def build_option_symbol_from_human(text: str):
 
     today = datetime.now(IST)
     year = today.year % 100
-    month_num = datetime.strptime(mon, "%b").month
-
-    if month_num < today.month:
+    if datetime.strptime(mon, "%b").month < today.month:
         year += 1
 
     return f"{underlying}{year:02d}{mon}{strike}{opt}"
 
 
 # =====================================================
-# PRICE MONITOR THREAD
+# MONITOR THREAD
 # =====================================================
 def price_monitor_worker(chat_id, user_id, symbol, entry_price):
-    try:
-        underlying = detect_underlying(symbol)
-        lot_size = LOT_SIZES[underlying]
-        exchange = "BSE" if underlying in ("SENSEX", "BANKEX") else "NSE"
+    underlying = detect_underlying(symbol)
+    lot_size = LOT_SIZES[underlying]
+    exchange = "BSE" if underlying in ("SENSEX", "BANKEX") else "NSE"
 
-        active_monitors[user_id] = {
-            "symbol": symbol,
-            "entry": entry_price,
-            "underlying": underlying,
-            "lot_size": lot_size,
-            "exchange": exchange,
-            "ltp": 0.0,
-            "final_lots": 0,
-            "status": "MONITORING",
-            "updated_at": ""
-        }
+    active_monitors[user_id] = {
+        "symbol": symbol,
+        "entry": entry_price,
+        "ltp": 0.0,
+        "status": "MONITORING",
+        "updated_at": ""
+    }
 
-        safe_send(
-            chat_id,
-            f"📡 Monitoring `{symbol}`\nEntry: {entry_price}",
-            parse_mode="Markdown"
-        )
+    safe_send(chat_id, f"📡 Monitoring `{symbol}` @ {entry_price}", parse_mode="Markdown")
 
-        while not price_watchers[user_id].is_set():
-            ltp = fetch_option_ltp(symbol, exchange)
-            if ltp is None:
-                time.sleep(2)
-                continue
-
-            risk_per_lot = ltp * lot_size
-            max_risk_lots = int(RISK_AMOUNT // risk_per_lot)
-            max_capital_lots = int(CAPITAL // risk_per_lot)
-            final_lots = max(0, min(max_risk_lots, max_capital_lots))
-
-            active_monitors[user_id].update({
-                "ltp": round(ltp, 2),
-                "final_lots": final_lots,
-                "updated_at": datetime.now(IST).strftime("%H:%M:%S")
-            })
+    while not price_watchers[user_id].is_set():
+        ltp = fetch_option_ltp(symbol, exchange)
+        if ltp:
+            active_monitors[user_id]["ltp"] = round(ltp, 2)
+            active_monitors[user_id]["updated_at"] = datetime.now(IST).strftime("%H:%M:%S")
 
             if ltp >= entry_price:
                 active_monitors[user_id]["status"] = "TRIGGERED"
-
                 safe_send(
                     chat_id,
                     f"🚨 *ENTRY HIT*\n\n"
-                    f"Symbol: `{symbol}`\n"
-                    f"LTP: ₹{ltp:.2f}\n"
-                    f"Lots: {final_lots}",
+                    f"{symbol}\n"
+                    f"LTP: ₹{ltp:.2f}",
                     parse_mode="Markdown"
                 )
                 break
 
-            time.sleep(2)
+        time.sleep(2)
 
-    except Exception as e:
-        safe_send(chat_id, f"⚠️ Monitor error: {e}")
-
-    finally:
-        price_watchers[user_id].set()
+    # cleanup
+    active_monitors.pop(user_id, None)
+    price_watchers.pop(user_id, None)
 
 
 # =====================================================
 # /start
 # =====================================================
-def start(update, context):
+def start(update, _):
     user_state[update.effective_user.id] = {"mode": None}
-
     safe_send(
         update.effective_chat.id,
         "👋 *Welcome*\n\n"
         "3️⃣ Monitor Option Price\n\n"
-        "Reply with *3*",
+        "Reply with *3*\n"
+        "Send *STOP* anytime to cancel",
         parse_mode="Markdown"
     )
 
@@ -218,68 +191,84 @@ dispatcher.add_handler(CommandHandler("start", start))
 # =====================================================
 # MESSAGE HANDLER
 # =====================================================
-def handle_message(update, context):
-    try:
-        uid = update.effective_user.id
-        cid = update.effective_chat.id
-        txt = update.message.text.strip().upper()
+def handle_message(update, _):
+    uid = update.effective_user.id
+    cid = update.effective_chat.id
+    txt = update.message.text.strip().upper()
 
-        if uid not in user_state:
-            safe_send(cid, "Type /start")
+    # -------- STOP MONITOR --------
+    if txt in ("STOP", "STOP MONITOR", "CANCEL"):
+        if uid in price_watchers:
+            price_watchers[uid].set()
+            safe_send(cid, "🛑 Monitoring stopped")
+        else:
+            safe_send(cid, "ℹ️ No active monitor")
+        user_state[uid] = {"mode": None}
+        return
+
+    state = user_state.setdefault(uid, {"mode": None})
+
+    # -------- MENU --------
+    if state["mode"] is None:
+        if txt == "3":
+            state["mode"] = "MONITOR"
+            state["step"] = 1
+            safe_send(
+                cid,
+                "Send option:\n"
+                "`NIFTY25DEC25950CE`\n"
+                "`SENSEX 01 JAN 85400 PE`",
+                parse_mode="Markdown"
+            )
             return
+        safe_send(cid, "Reply with *3* to start monitoring", parse_mode="Markdown")
+        return
 
-        state = user_state[uid]
+    # -------- MONITOR FLOW --------
+    if state["mode"] == "MONITOR":
 
-        if state["mode"] is None:
-            if txt == "3":
-                state["mode"] = "MONITOR"
-                state["step"] = 1
+        # STEP 1: OPTION
+        if state["step"] == 1:
+            raw = txt.replace("OPTION", "").strip()
+            symbol = raw if raw[-2:] in ("CE", "PE") else build_option_symbol_from_human(raw)
+
+            if not symbol:
                 safe_send(
                     cid,
-                    "Send:\n`OPTION NIFTY25DEC25950CE`\nOR\n`OPTION SENSEX 01 JAN 85400 PE`",
+                    "❌ Invalid option format.\nTry again:\n`SENSEX 01 JAN 85400 PE`",
                     parse_mode="Markdown"
                 )
                 return
 
-            safe_send(cid, "Only option *3* is active now", parse_mode="Markdown")
+            state["symbol"] = symbol
+            state["step"] = 2
+            safe_send(cid, "Send entry price (example: 345)", parse_mode="Markdown")
             return
 
-        if state["mode"] == "MONITOR":
-            if state["step"] == 1:
-                raw = txt.replace("OPTION", "").strip()
-                symbol = raw if raw[-2:] in ("CE", "PE") else build_option_symbol_from_human(raw)
-
-                if not symbol:
-                    safe_send(cid, "❌ Invalid option format")
-                    return
-
-                state["symbol"] = symbol
-                state["step"] = 2
-                safe_send(cid, "Send:\n`PRICE 120.5`", parse_mode="Markdown")
+        # STEP 2: PRICE
+        if state["step"] == 2:
+            try:
+                entry_price = float(txt.split()[-1])
+            except ValueError:
+                safe_send(cid, "❌ Invalid price.\nSend number like: 345", parse_mode="Markdown")
                 return
 
-            if state["step"] == 2:
-                entry_price = float(txt.split()[1])
-                price_watchers[uid] = threading.Event()
+            price_watchers[uid] = threading.Event()
+            threading.Thread(
+                target=price_monitor_worker,
+                args=(cid, uid, state["symbol"], entry_price),
+                daemon=True
+            ).start()
 
-                threading.Thread(
-                    target=price_monitor_worker,
-                    args=(cid, uid, state["symbol"], entry_price),
-                    daemon=True
-                ).start()
-
-                user_state[uid] = {"mode": None}
-                return
-
-    except Exception:
-        traceback.print_exc()
+            user_state[uid] = {"mode": None}
+            return
 
 
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
 
 # =====================================================
-# WEBHOOK (REQUIRED FOR RAILWAY)
+# WEBHOOK
 # =====================================================
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -293,24 +282,11 @@ def webhook():
 # =====================================================
 @app.route("/api/monitors")
 def api_monitors():
-    rows = []
-    for v in active_monitors.values():
-        entry = v["entry"]
-        ltp = v["ltp"]
-        pnl_pct = ((ltp - entry) / entry * 100) if entry else 0
-        capital_pnl = pnl_pct / 100 * CAPITAL
-
-        rows.append({
-            **v,
-            "pnl_pct": round(pnl_pct, 2),
-            "capital_pnl": round(capital_pnl, 2)
-        })
-
-    return jsonify(rows)
+    return jsonify(list(active_monitors.values()))
 
 
 # =====================================================
-# ROOT / HEALTH / DASHBOARD
+# DASHBOARD
 # =====================================================
 @app.route("/")
 def index():
