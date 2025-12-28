@@ -314,7 +314,7 @@ def api_monitors():
 # =====================================================
 @app.route("/")
 def index():
-    return "✅ Option Monitor Bot Running"
+    return render_template("index.html")
 
 
 if __name__ == "__main__":
