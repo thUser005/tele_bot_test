@@ -180,6 +180,7 @@ def handle_message(update, _):
     cid = update.effective_chat.id
     txt = update.message.text.strip().upper()
 
+    # STOP
     if txt in ("STOP", "CANCEL"):
         if uid in price_watchers:
             price_watchers[uid].set()
@@ -197,7 +198,9 @@ def handle_message(update, _):
             state["step"] = 1
             safe_send(
                 cid,
-                "Send option:\n`NIFTY25DEC25950CE`\n`SENSEX 01 JAN 85400 PE`",
+                "Send option:\n"
+                "`NIFTY25DEC25950CE`\n"
+                "`SENSEX 01 JAN 85400 PE`",
                 parse_mode="Markdown"
             )
             return
@@ -205,9 +208,16 @@ def handle_message(update, _):
         return
 
     if state["mode"] == "MONITOR":
+
+        # STEP 1 — OPTION
         if state["step"] == 1:
             raw = txt
-            trade_symbol = raw if raw[-2:] in ("CE", "PE") else build_option_symbol_from_human(raw)
+
+            if " " in raw:
+                trade_symbol = build_option_symbol_from_human(raw)
+            else:
+                trade_symbol = raw
+
             if not trade_symbol:
                 safe_send(cid, "❌ Invalid option format", parse_mode="Markdown")
                 return
@@ -218,6 +228,7 @@ def handle_message(update, _):
             safe_send(cid, "Send entry price (example: 345)", parse_mode="Markdown")
             return
 
+        # STEP 2 — PRICE
         if state["step"] == 2:
             try:
                 entry_price = float(txt)
