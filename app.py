@@ -99,6 +99,13 @@ def safe_send(chat_id, text, **kw):
 # OPTION PARSER
 # =====================================================
 def build_option_symbol_from_human(text):
+    """
+    Examples:
+    SENSEX 18 OCT 84400 PE  -> SENSEX2610184400PE
+    BANKEX 18 OCT 44500 CE  -> BANKEX26101844500CE
+    NIFTY 25 JAN 25950 CE   -> NIFTY26JAN25950CE
+    """
+
     parts = text.split()
     if len(parts) != 5:
         return None
@@ -112,9 +119,18 @@ def build_option_symbol_from_human(text):
 
     today = datetime.now(IST)
     year = today.year % 100
-    if datetime.strptime(mon, "%b").month < today.month:
+    month_num = datetime.strptime(mon, "%b").month
+    day = int(day)
+
+    # roll year if expiry month already passed
+    if month_num < today.month:
         year += 1
 
+    # 🔥 BSE indices use YYMMDD
+    if underlying in ("SENSEX", "BANKEX"):
+        return f"{underlying}{year:02d}{month_num:02d}{day:02d}{strike}{opt}"
+
+    # 🔥 NSE indices use YYMON
     return f"{underlying}{year:02d}{mon}{strike}{opt}"
 
 # =====================================================
