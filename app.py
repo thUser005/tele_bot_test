@@ -1,11 +1,10 @@
 import os
 import time
 import threading
-import traceback
 import requests
 from datetime import datetime, timedelta, timezone
 
-from flask import Flask, request
+from flask import Flask, request, jsonify, render_template
 from telegram import Bot, Update
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
 from telegram.utils.request import Request
@@ -36,7 +35,7 @@ LOT_SIZES = {
 }
 
 # =====================================================
-# GROWW CHART API
+# GROWW API
 # =====================================================
 BASE_CHART_URL = (
     "https://groww.in/v1/api/stocks_fo_data/v1/"
@@ -51,7 +50,25 @@ HEADERS = {
 }
 
 # =====================================================
-# TIME / UTIL
+# FLASK / TELEGRAM INIT
+# =====================================================
+bot = Bot(
+    token=TOKEN,
+    request=Request(con_pool_size=8, connect_timeout=5, read_timeout=5),
+)
+
+app = Flask(__name__)
+dispatcher = Dispatcher(bot, None, workers=1)
+
+# =====================================================
+# STATE
+# =====================================================
+user_state = {}
+price_watchers = {}
+active_monitors = {}   # Used by dashboard
+
+# =====================================================
+# UTIL
 # =====================================================
 def now_millis():
     return int(datetime.now(IST).timestamp() * 1000)
@@ -82,14 +99,19 @@ def fetch_option_ltp(symbol: str, exchange: str):
     return candles[-1][4] if candles else None
 
 
+def safe_send(chat_id, text, **kw):
+    try:
+        bot.send_message(chat_id, text, **kw)
+    except Exception as e:
+        print("Telegram error:", e)
+
+
 # =====================================================
-# HUMAN OPTION FORMAT PARSER
+# OPTION FORMAT PARSER
 # =====================================================
 def build_option_symbol_from_human(text: str):
     """
-    Converts:
-    SENSEX 01 JAN 85400 PE
-    → SENSEX26JAN85400PE
+    SENSEX 01 JAN 85400 PE → SENSEX26JAN85400PE
     """
     parts = text.split()
     if len(parts) != 5:
@@ -113,197 +135,153 @@ def build_option_symbol_from_human(text: str):
 
 
 # =====================================================
-# TELEGRAM BOT INIT
-# =====================================================
-bot = Bot(
-    token=TOKEN,
-    request=Request(con_pool_size=8, connect_timeout=5, read_timeout=5),
-)
-
-app = Flask(__name__)
-dispatcher = Dispatcher(bot, None, workers=1)
-
-# =====================================================
-# STATE
-# =====================================================
-user_state = {}
-price_watchers = {}
-
-# =====================================================
-# SAFE SEND
-# =====================================================
-def safe_send(chat_id, text, **kw):
-    try:
-        bot.send_message(chat_id, text, **kw)
-    except Exception as e:
-        print("⚠️ Telegram error:", e)
-
-
-# =====================================================
 # PRICE MONITOR THREAD
 # =====================================================
 def price_monitor_worker(chat_id, user_id, symbol, entry_price):
-    try:
-        underlying = detect_underlying(symbol)
-        lot_size = LOT_SIZES[underlying]
-        exchange = "BSE" if underlying in ("SENSEX", "BANKEX") else "NSE"
+    underlying = detect_underlying(symbol)
+    lot_size = LOT_SIZES[underlying]
+    exchange = "BSE" if underlying in ("SENSEX", "BANKEX") else "NSE"
 
-        safe_send(
-            chat_id,
-            f"📡 Monitoring `{symbol}`\nEntry: {entry_price}",
-            parse_mode="Markdown"
-        )
+    active_monitors[user_id] = {
+        "symbol": symbol,
+        "entry": entry_price,
+        "underlying": underlying,
+        "lot_size": lot_size,
+        "exchange": exchange,
+        "ltp": 0.0,
+        "final_lots": 0,
+        "status": "MONITORING",
+        "updated_at": ""
+    }
 
-        while not price_watchers[user_id].is_set():
-            ltp = fetch_option_ltp(symbol, exchange)
+    safe_send(
+        chat_id,
+        f"📡 Monitoring `{symbol}`\nEntry: {entry_price}",
+        parse_mode="Markdown"
+    )
 
-            if ltp is None:
-                time.sleep(2)
-                continue
+    while not price_watchers[user_id].is_set():
+        ltp = fetch_option_ltp(symbol, exchange)
+
+        if ltp:
+            risk_per_lot = ltp * lot_size
+            max_risk_lots = int(RISK_AMOUNT // risk_per_lot)
+            max_cap_lots = int(CAPITAL // risk_per_lot)
+            final_lots = max(0, min(max_risk_lots, max_cap_lots))
+
+            active_monitors[user_id].update({
+                "ltp": round(ltp, 2),
+                "final_lots": final_lots,
+                "updated_at": datetime.now(IST).strftime("%H:%M:%S")
+            })
 
             if ltp >= entry_price:
-                risk_per_lot = ltp * lot_size
-                max_risk_lots = int(RISK_AMOUNT // risk_per_lot)
-                max_capital_lots = int(CAPITAL // risk_per_lot)
-                final_lots = max(0, min(max_risk_lots, max_capital_lots))
+                active_monitors[user_id]["status"] = "TRIGGERED"
 
                 safe_send(
                     chat_id,
                     f"🚨 *ENTRY HIT*\n\n"
                     f"Symbol: `{symbol}`\n"
-                    f"Underlying: {underlying}\n"
                     f"LTP: ₹{ltp:.2f}\n"
-                    f"Lot Size: {lot_size}\n\n"
-                    f"💰 Capital: ₹{CAPITAL}\n"
-                    f"🛑 Risk (1%): ₹{RISK_AMOUNT}\n\n"
-                    f"Risk / Lot: ₹{risk_per_lot:.2f}\n"
-                    f"Max Risk Lots: {max_risk_lots}\n"
-                    f"Max Capital Lots: {max_capital_lots}\n\n"
-                    f"✅ *Final Tradable Lots: {final_lots}*",
+                    f"Lots: {final_lots}",
                     parse_mode="Markdown"
                 )
                 break
 
-            time.sleep(2)
+        time.sleep(2)
 
-    except Exception as e:
-        safe_send(chat_id, f"⚠️ Monitor error: {e}")
-
-    finally:
-        price_watchers[user_id].set()
-        del price_watchers[user_id]
+    price_watchers[user_id].set()
 
 
 # =====================================================
-# /start
+# TELEGRAM HANDLERS
 # =====================================================
-def start(update, context):
+def start(update, _):
     user_state[update.effective_user.id] = {"mode": None}
-
     safe_send(
         update.effective_chat.id,
         "👋 *Welcome*\n\n"
-        "1️⃣ Add Two Numbers\n"
-        "2️⃣ Bot Health Alerts\n"
         "3️⃣ Monitor Option Price\n\n"
-        "Reply with *1–3*",
+        "Reply with *3*",
         parse_mode="Markdown"
     )
 
 
+def handle_message(update, _):
+    uid = update.effective_user.id
+    cid = update.effective_chat.id
+    txt = update.message.text.strip().upper()
+
+    state = user_state.setdefault(uid, {"mode": None})
+
+    if state["mode"] is None and txt == "3":
+        state["mode"] = "MONITOR"
+        state["step"] = 1
+        safe_send(
+            cid,
+            "Send:\n`OPTION NIFTY25DEC25950CE`\nOR\n`OPTION SENSEX 01 JAN 85400 PE`",
+            parse_mode="Markdown"
+        )
+        return
+
+    if state.get("mode") == "MONITOR":
+        if state["step"] == 1:
+            raw = txt.replace("OPTION", "").strip()
+            symbol = raw if raw[-2:] in ("CE", "PE") else build_option_symbol_from_human(raw)
+
+            if not symbol:
+                safe_send(cid, "❌ Invalid option format")
+                return
+
+            state["symbol"] = symbol
+            state["step"] = 2
+            safe_send(cid, "Send:\n`PRICE 120.5`", parse_mode="Markdown")
+            return
+
+        if state["step"] == 2:
+            entry_price = float(txt.split()[1])
+            price_watchers[uid] = threading.Event()
+
+            threading.Thread(
+                target=price_monitor_worker,
+                args=(cid, uid, state["symbol"], entry_price),
+                daemon=True
+            ).start()
+
+            user_state[uid] = {"mode": None}
+            return
+
+
 dispatcher.add_handler(CommandHandler("start", start))
-
-
-# =====================================================
-# MESSAGE HANDLER
-# =====================================================
-def handle_message(update, context):
-    try:
-        uid = update.effective_user.id
-        cid = update.effective_chat.id
-        txt = update.message.text.strip().upper()
-
-        if uid not in user_state:
-            safe_send(cid, "Type /start")
-            return
-
-        state = user_state[uid]
-
-        # MENU
-        if state["mode"] is None:
-            if txt == "3":
-                state["mode"] = "MONITOR"
-                state["step"] = 1
-                safe_send(cid, "Send:\n`OPTION NIFTY25DEC25950CE`\nOR\n`OPTION SENSEX 01 JAN 85400 PE`",
-                          parse_mode="Markdown")
-                return
-
-            safe_send(cid, "Only option *3* is active now", parse_mode="Markdown")
-            return
-
-        # MONITOR MODE
-        if state["mode"] == "MONITOR":
-            if state["step"] == 1:
-                if not txt.startswith("OPTION"):
-                    safe_send(cid, "Use:\nOPTION SYMBOL")
-                    return
-
-                raw = txt.replace("OPTION", "").strip()
-
-                if raw[-2:] in ("CE", "PE") and any(c.isdigit() for c in raw):
-                    symbol = raw
-                else:
-                    symbol = build_option_symbol_from_human(raw)
-
-                if not symbol:
-                    safe_send(cid, "❌ Invalid option format")
-                    return
-
-                state["symbol"] = symbol
-                state["step"] = 2
-                safe_send(cid, "Send:\n`PRICE 120.5`", parse_mode="Markdown")
-                return
-
-            if state["step"] == 2:
-                if not txt.startswith("PRICE"):
-                    safe_send(cid, "Use:\nPRICE 120.5")
-                    return
-
-                entry_price = float(txt.split()[1])
-                symbol = state["symbol"]
-
-                stop_event = threading.Event()
-                price_watchers[uid] = stop_event
-
-                threading.Thread(
-                    target=price_monitor_worker,
-                    args=(cid, uid, symbol, entry_price),
-                    daemon=True
-                ).start()
-
-                user_state[uid] = {"mode": None}
-                return
-
-    except Exception:
-        traceback.print_exc()
-
-
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
+# =====================================================
+# DASHBOARD API
+# =====================================================
+@app.route("/api/monitors")
+def api_monitors():
+    rows = []
+    for v in active_monitors.values():
+        entry = v["entry"]
+        ltp = v["ltp"]
+        pnl_pct = ((ltp - entry) / entry * 100) if entry else 0
+        capital_pnl = pnl_pct / 100 * CAPITAL
+
+        rows.append({
+            **v,
+            "pnl_pct": round(pnl_pct, 2),
+            "capital_pnl": round(capital_pnl, 2)
+        })
+
+    return jsonify(rows)
+
 
 # =====================================================
-# WEBHOOK / HEALTH
+# HTML DASHBOARD
 # =====================================================
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
-    return "OK", 200
-
-
 @app.route("/")
-def index():
-    return "✅ Option Monitor Bot Running"
+def dashboard():
+    return render_template("index.html")
 
 
 if __name__ == "__main__":
