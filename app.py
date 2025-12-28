@@ -83,7 +83,7 @@ def fetch_option_ltp(trade_symbol, exchange):
         f"&intervalInMinutes=1"
     )
 
-    r = requests.get(url, headers=HEADERS, timeout=5)
+    r = requests.get(url, headers=HEADERS, timeout=6)
     r.raise_for_status()
     candles = r.json().get("candles", [])
     return candles[-1][4] if candles else None
@@ -96,11 +96,11 @@ def safe_send(chat_id, text, **kw):
         print("Telegram error:", e)
 
 # =====================================================
-# OPTION PARSER
+# OPTION PARSER (FINAL)
 # =====================================================
 def build_option_symbol_from_human(text):
     """
-    Unified expiry format for ALL indices:
+    Unified format for Groww (NSE + BSE):
     <UNDERLYING><YY><M><DD><STRIKE><CE|PE>
 
     Examples:
@@ -114,8 +114,8 @@ def build_option_symbol_from_human(text):
         return None
 
     underlying, day, mon, strike, opt = parts
-    mon = mon.upper()
     opt = opt.upper()
+    mon = mon.upper()
 
     if opt not in ("CE", "PE"):
         return None
@@ -129,11 +129,9 @@ def build_option_symbol_from_human(text):
     today = datetime.now(IST)
     year = today.year % 100
 
-    # roll year if expiry month already passed
     if month_num < today.month:
         year += 1
 
-    # ✅ SAME FORMAT FOR NSE + BSE
     return f"{underlying}{year:02d}{month_num}{day:02d}{strike}{opt}"
 
 # =====================================================
@@ -141,7 +139,6 @@ def build_option_symbol_from_human(text):
 # =====================================================
 def price_monitor_worker(chat_id, user_id, trade_symbol, display_symbol, entry_price):
     underlying = detect_underlying(trade_symbol)
-    lot_size = LOT_SIZES[underlying]
     exchange = "BSE" if underlying in ("SENSEX", "BANKEX") else "NSE"
 
     active_monitors[user_id] = {
@@ -156,8 +153,13 @@ def price_monitor_worker(chat_id, user_id, trade_symbol, display_symbol, entry_p
     safe_send(chat_id, f"📡 Monitoring `{display_symbol}` @ {entry_price}", parse_mode="Markdown")
 
     while not price_watchers[user_id].is_set():
-        ltp = fetch_option_ltp(trade_symbol, exchange)
-        if ltp:
+        try:
+            ltp = fetch_option_ltp(trade_symbol, exchange)
+        except Exception:
+            time.sleep(3)
+            continue
+
+        if ltp is not None:  # ✅ CRITICAL FIX
             active_monitors[user_id]["ltp"] = round(ltp, 2)
             active_monitors[user_id]["updated_at"] = datetime.now(IST).strftime("%H:%M:%S")
 
@@ -172,8 +174,7 @@ def price_monitor_worker(chat_id, user_id, trade_symbol, display_symbol, entry_p
 
         time.sleep(2)
 
-    active_monitors.pop(user_id, None)
-    price_watchers.pop(user_id, None)
+    active_monitors[user_id]["status"] = "STOPPED"
 
 # =====================================================
 # /start
@@ -199,7 +200,6 @@ def handle_message(update, _):
     cid = update.effective_chat.id
     txt = update.message.text.strip().upper()
 
-    # STOP
     if txt in ("STOP", "CANCEL"):
         if uid in price_watchers:
             price_watchers[uid].set()
@@ -228,15 +228,10 @@ def handle_message(update, _):
 
     if state["mode"] == "MONITOR":
 
-        # STEP 1 — OPTION
         if state["step"] == 1:
             raw = txt
 
-            if " " in raw:
-                trade_symbol = build_option_symbol_from_human(raw)
-            else:
-                trade_symbol = raw
-
+            trade_symbol = build_option_symbol_from_human(raw) if " " in raw else raw
             if not trade_symbol:
                 safe_send(cid, "❌ Invalid option format", parse_mode="Markdown")
                 return
@@ -247,7 +242,6 @@ def handle_message(update, _):
             safe_send(cid, "Send entry price (example: 345)", parse_mode="Markdown")
             return
 
-        # STEP 2 — PRICE
         if state["step"] == 2:
             try:
                 entry_price = float(txt)
@@ -276,11 +270,29 @@ def webhook():
     return "OK", 200
 
 # =====================================================
-# DASHBOARD API
+# DASHBOARD API (SAFE)
 # =====================================================
 @app.route("/api/monitors")
 def api_monitors():
-    return jsonify(list(active_monitors.values()))
+    rows = []
+    for v in active_monitors.values():
+        entry = v["entry"]
+        ltp = v["ltp"]
+
+        if ltp > 0 and entry > 0:
+            pnl_pct = round(((ltp - entry) / entry) * 100, 2)
+            capital_pnl = round((pnl_pct / 100) * CAPITAL, 2)
+        else:
+            pnl_pct = 0.0
+            capital_pnl = 0.0
+
+        rows.append({
+            **v,
+            "pnl_pct": pnl_pct,
+            "capital_pnl": capital_pnl
+        })
+
+    return jsonify(rows)
 
 # =====================================================
 # DASHBOARD
