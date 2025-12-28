@@ -1,5 +1,7 @@
 import os
 import json
+import time
+import threading
 import traceback
 from flask import Flask, request, Response
 from telegram import Bot, Update
@@ -14,6 +16,8 @@ TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("❌ TELEGRAM_BOT_TOKEN not set")
 
+ALERT_INTERVAL_SECONDS = 60 * 60  # 1 hour
+
 # =====================================================
 # TELEGRAM BOT (Railway-safe)
 # =====================================================
@@ -22,7 +26,6 @@ tg_request = Request(
     connect_timeout=5,
     read_timeout=5
 )
-
 bot = Bot(token=TOKEN, request=tg_request)
 
 # =====================================================
@@ -32,12 +35,13 @@ app = Flask(__name__)
 dispatcher = Dispatcher(bot, None, workers=1)
 
 # =====================================================
-# IN-MEMORY USER STATE
+# IN-MEMORY STATE
 # =====================================================
 user_state = {}
+alert_users = {}   # user_id -> threading.Event()
 
 # =====================================================
-# SAFE SEND FUNCTION (CRITICAL)
+# SAFE SEND FUNCTIONS
 # =====================================================
 def safe_send(chat_id, text, **kwargs):
     try:
@@ -57,6 +61,14 @@ def safe_document(chat_id, file_bytes, filename, caption=None):
         print("⚠️ Telegram document send failed:", e)
 
 # =====================================================
+# ALERT WORKER
+# =====================================================
+def alert_worker(chat_id, stop_event):
+    while not stop_event.is_set():
+        safe_send(chat_id, "🟢 Bot is alive and working ✅")
+        stop_event.wait(ALERT_INTERVAL_SECONDS)
+
+# =====================================================
 # /start COMMAND
 # =====================================================
 def start(update, context):
@@ -68,12 +80,28 @@ def start(update, context):
         "👋 *Welcome*\n\n"
         "Choose an option:\n\n"
         "1️⃣ Option Chain by Date\n"
-        "2️⃣ Add Two Numbers\n\n"
-        "Reply with *1* or *2*",
+        "2️⃣ Add Two Numbers\n"
+        "3️⃣ Bot Health Alerts (every 1 hour)\n\n"
+        "Reply with *1*, *2* or *3*",
         parse_mode="Markdown"
     )
 
 dispatcher.add_handler(CommandHandler("start", start))
+
+# =====================================================
+# /stop ALERTS
+# =====================================================
+def stop_alerts(update, context):
+    user_id = update.effective_user.id
+
+    if user_id in alert_users:
+        alert_users[user_id].set()
+        del alert_users[user_id]
+        safe_send(update.effective_chat.id, "🔕 Alerts stopped")
+    else:
+        safe_send(update.effective_chat.id, "ℹ️ No active alerts")
+
+dispatcher.add_handler(CommandHandler("stop", stop_alerts))
 
 # =====================================================
 # MESSAGE HANDLER
@@ -113,7 +141,31 @@ def handle_message(update, context):
                 safe_send(chat_id, "➕ Send first number")
                 return
 
-            safe_send(chat_id, "Please reply with *1* or *2*", parse_mode="Markdown")
+            if text == "3":
+                if user_id in alert_users:
+                    safe_send(chat_id, "ℹ️ Alerts already running")
+                    return
+
+                stop_event = threading.Event()
+                alert_users[user_id] = stop_event
+
+                t = threading.Thread(
+                    target=alert_worker,
+                    args=(chat_id, stop_event),
+                    daemon=True
+                )
+                t.start()
+
+                safe_send(
+                    chat_id,
+                    "🟢 *Bot Health Alerts Enabled*\n\n"
+                    "You will receive a message every 1 hour.\n"
+                    "Use /stop to disable.",
+                    parse_mode="Markdown"
+                )
+                return
+
+            safe_send(chat_id, "Please reply with *1*, *2* or *3*", parse_mode="Markdown")
             return
 
         # ============================
@@ -133,14 +185,12 @@ def handle_message(update, context):
             underlying = "NIFTY"
 
             data = get_data_fun(expiry, underlying)
-
             file_bytes = json.dumps(data, indent=2).encode("utf-8")
-            filename = f"option_chain_{expiry}.json"
 
             safe_document(
                 chat_id,
                 file_bytes,
-                filename,
+                f"option_chain_{expiry}.json",
                 caption=f"📄 Option chain for {expiry}"
             )
 
@@ -169,7 +219,7 @@ def handle_message(update, context):
                 user_state[user_id] = {"mode": None}
                 return
 
-    except Exception as e:
+    except Exception:
         print("❌ Message handler error")
         traceback.print_exc()
 
@@ -178,7 +228,7 @@ dispatcher.add_handler(
 )
 
 # =====================================================
-# WEBHOOK ENDPOINT
+# WEBHOOK
 # =====================================================
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -186,26 +236,21 @@ def webhook():
         update = Update.de_json(request.get_json(force=True), bot)
         dispatcher.process_update(update)
     except Exception:
-        print("❌ Webhook processing error")
+        print("❌ Webhook error")
         traceback.print_exc()
     return "OK", 200
 
 # =====================================================
-# HTTP API (Browser / Curl)
+# API
 # =====================================================
 @app.route("/api")
 def api():
     try:
         expiry = request.args.get("expiry")
-        underlying = request.args.get("underlying", "NIFTY")
-
         if not expiry:
-            return {
-                "error": "expiry is required",
-                "example": "/api?expiry=2026-01-08&underlying=NIFTY"
-            }, 400
+            return {"error": "expiry required"}, 400
 
-        data = get_data_fun(expiry, underlying)
+        data = get_data_fun(expiry, "NIFTY")
         return Response(json.dumps(data, indent=2), mimetype="application/json")
 
     except Exception as e:
