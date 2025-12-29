@@ -81,6 +81,8 @@
 </div>
 
 <script>
+let pollingHandle = null;
+
 function statusBadge(status) {
     if (status === "ENTERED") {
         return '<span class="badge badge-entered">ENTERED</span>';
@@ -102,15 +104,22 @@ async function loadData() {
         const res = await fetch("/api/monitor");
         const text = await res.text();
 
-        // 🔴 PLAIN TEXT RESPONSE (market closed, waiting, etc.)
+        // 🔴 Plain text response (market closed / waiting)
         if (!text.trim().startsWith("[")) {
             tbody.innerHTML = "";
             statusBox.innerText = text;
             statusBox.classList.remove("d-none");
+
+            // ⛔ Stop polling after market close
+            if (text.includes("Market closed") && pollingHandle) {
+                clearInterval(pollingHandle);
+                pollingHandle = null;
+                console.log("🛑 Polling stopped — market closed");
+            }
             return;
         }
 
-        // 🟢 JSON RESPONSE
+        // 🟢 JSON data
         const data = JSON.parse(text);
         tbody.innerHTML = "";
         statusBox.classList.add("d-none");
@@ -151,7 +160,8 @@ async function loadData() {
     }
 }
 
-setInterval(loadData, 3000);
+// ▶ Start polling
+pollingHandle = setInterval(loadData, 3000);
 loadData();
 </script>
 
