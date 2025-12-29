@@ -39,7 +39,7 @@ client = MongoClient(MONGO_URI)
 collection = client[DB][COL]
 
 live_table = {}
-trade_state = {}   # symbol → trade lifecycle
+trade_state = {}
 lock = threading.Lock()
 
 # =====================================================
@@ -58,9 +58,14 @@ def is_market_open():
     now = datetime.now(IST).time()
     return MARKET_OPEN <= now <= MARKET_CLOSE
 
-# -----------------------------------------------------
+def clear_live_data():
+    with lock:
+        live_table.clear()
+        trade_state.clear()
+
+# =====================================================
 # FETCH LTP WITH RETRY
-# -----------------------------------------------------
+# =====================================================
 def fetch_ltp_with_retry(symbol):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -88,9 +93,9 @@ def fetch_ltp_with_retry(symbol):
 
     return None
 
-# -----------------------------------------------------
+# =====================================================
 # PROCESS SINGLE STOCK (STATE MACHINE)
-# -----------------------------------------------------
+# =====================================================
 def process_symbol(signal):
     symbol = signal["symbol"]
     entry = signal["entry"]
@@ -109,18 +114,15 @@ def process_symbol(signal):
         "exit_price": None
     })
 
-    # ---------------- ENTRY ----------------
     if state["status"] == "PENDING" and ltp >= entry:
         state["status"] = "ENTERED"
         state["entry_time"] = now_str()
 
-    # ---------------- TARGET ----------------
     if state["status"] == "ENTERED" and ltp >= target:
         state["status"] = "EXITED_TARGET"
         state["exit_time"] = now_str()
         state["exit_price"] = target
 
-    # ---------------- STOPLOSS ----------------
     if state["status"] == "ENTERED" and ltp <= stoploss:
         state["status"] = "EXITED_SL"
         state["exit_time"] = now_str()
@@ -128,7 +130,6 @@ def process_symbol(signal):
 
     trade_state[symbol] = state
 
-    # ---------------- P/L CALC ----------------
     effective_price = (
         state["exit_price"]
         if state["status"].startswith("EXITED")
@@ -172,11 +173,13 @@ def monitor_worker():
     while True:
         try:
             if not is_market_open():
+                clear_live_data()
                 time.sleep(30)
                 continue
 
             doc = collection.find_one({"trade_date": today()})
             if not doc or not doc.get("buy_signals"):
+                clear_live_data()
                 time.sleep(5)
                 continue
 
@@ -190,11 +193,9 @@ def monitor_worker():
 
                 for future in as_completed(futures):
                     result = future.result()
-                    if not result:
-                        continue
-
-                    with lock:
-                        live_table[result["symbol"]] = result
+                    if result:
+                        with lock:
+                            live_table[result["symbol"]] = result
 
         except Exception as e:
             print("Monitor loop error:", e)
@@ -208,30 +209,31 @@ def monitor_worker():
 def api_monitor():
     current_time = now_str()
 
-    # 🔹 Market closed
     if not is_market_open():
-        msg = (
-            f"Present time: {current_time} — "
-            f"Market closed (09:15–15:30 IST)"
+        clear_live_data()
+        return (
+            f"Present time: {current_time} — Market closed (09:15–15:30 IST)",
+            200,
+            {"Content-Type": "text/plain; charset=utf-8"}
         )
-        return msg, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
-    # 🔹 BUY signals not yet saved
     doc = collection.find_one({"trade_date": today()})
     if not doc or not doc.get("buy_signals"):
-        msg = f"Present time: {current_time} — BUY signals not yet saved"
-        return msg, 200, {"Content-Type": "text/plain; charset=utf-8"}
+        clear_live_data()
+        return (
+            f"Present time: {current_time} — BUY signals not yet saved",
+            200,
+            {"Content-Type": "text/plain; charset=utf-8"}
+        )
 
-    # 🔹 Signals exist but prices not fetched yet
     with lock:
         if not live_table:
-            msg = (
-                f"Present time: {current_time} — "
-                f"BUY signals loaded, waiting for live prices"
+            return (
+                f"Present time: {current_time} — BUY signals loaded, waiting for live prices",
+                200,
+                {"Content-Type": "text/plain; charset=utf-8"}
             )
-            return msg, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
-        # 🔹 Normal live data
         return jsonify(list(live_table.values()))
 
 # =====================================================
