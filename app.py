@@ -2,297 +2,237 @@ import os
 import time
 import threading
 import requests
-from datetime import datetime, timedelta, timezone
-
-from flask import Flask, request, jsonify, render_template
-from telegram import Bot, Update
-from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
-from telegram.utils.request import Request
+from datetime import datetime, timedelta, timezone, time as dtime
+from pymongo import MongoClient
+from flask import Flask, jsonify, render_template
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =====================================================
 # CONFIG
 # =====================================================
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError("❌ TELEGRAM_BOT_TOKEN not set")
+MONGO_URI = os.getenv("MONGO_URI")
+DB = "trading"
+COL = "daily_signals"
 
 CAPITAL = 20_000
-RISK_PCT = 0.01
-RISK_AMOUNT = CAPITAL * RISK_PCT
+MARGIN = 5
+
+INTERVAL_SECONDS = 3
+MAX_WORKERS = 15
+MAX_RETRIES = 3
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-LOT_SIZES = {
-    "NIFTY": 75,
-    "BANKNIFTY": 15,
-    "FINNIFTY": 40,
-    "MIDCPNIFTY": 50,
-    "SENSEX": 10,
-    "BANKEX": 15,
-}
+MARKET_OPEN = dtime(9, 15)
+MARKET_CLOSE = dtime(15, 30)
 
-BASE_CHART_URL = (
-    "https://groww.in/v1/api/stocks_fo_data/v1/"
-    "charting_service/delayed/chart"
+GROWW_URL = (
+    "https://groww.in/v1/api/charting_service/v2/chart/"
+    "delayed/exchange/NSE/segment/CASH"
 )
-
-HEADERS = {
-    "accept": "application/json, text/plain, */*",
-    "x-app-id": "growwWeb",
-    "x-device-type": "charts",
-    "x-platform": "web",
-}
 
 # =====================================================
 # INIT
 # =====================================================
-bot = Bot(
-    token=TOKEN,
-    request=Request(con_pool_size=8, connect_timeout=5, read_timeout=5),
-)
-
 app = Flask(__name__)
-dispatcher = Dispatcher(bot, None, workers=1)
+client = MongoClient(MONGO_URI)
+collection = client[DB][COL]
 
-user_state = {}
-price_watchers = {}
-active_monitors = {}
+live_table = {}
+trade_state = {}   # symbol → trade lifecycle
+lock = threading.Lock()
 
 # =====================================================
-# UTIL
+# UTILS
 # =====================================================
-def now_millis():
+def today():
+    return datetime.now(IST).strftime("%Y-%m-%d")
+
+def now_ms():
     return int(datetime.now(IST).timestamp() * 1000)
 
+def now_str():
+    return datetime.now(IST).strftime("%H:%M:%S")
 
-def detect_underlying(symbol):
-    for k in LOT_SIZES:
-        if symbol.startswith(k):
-            return k
-    return "NIFTY"
+def is_market_open():
+    now = datetime.now(IST).time()
+    return MARKET_OPEN <= now <= MARKET_CLOSE
 
+# -----------------------------------------------------
+# FETCH LTP WITH RETRY
+# -----------------------------------------------------
+def fetch_ltp_with_retry(symbol):
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            end = now_ms()
+            start = end - 3 * 60 * 1000
 
-def fetch_option_ltp(trade_symbol, exchange):
-    end_ms = now_millis()
-    start_ms = end_ms - 5 * 60 * 1000
+            r = requests.get(
+                f"{GROWW_URL}/{symbol}",
+                params={
+                    "startTimeInMillis": start,
+                    "endTimeInMillis": end,
+                    "intervalInMinutes": 1
+                },
+                timeout=5
+            )
+            r.raise_for_status()
 
-    url = (
-        f"{BASE_CHART_URL}/exchange/{exchange}/segment/FNO/{trade_symbol}"
-        f"?startTimeInMillis={start_ms}"
-        f"&endTimeInMillis={end_ms}"
-        f"&intervalInMinutes=1"
+            candles = r.json().get("candles", [])
+            if candles:
+                return candles[-1][4]
+
+        except Exception:
+            if attempt < MAX_RETRIES:
+                time.sleep(0.4)
+
+    return None
+
+# -----------------------------------------------------
+# PROCESS SINGLE STOCK (STATE MACHINE)
+# -----------------------------------------------------
+def process_symbol(signal):
+    symbol = signal["symbol"]
+    entry = signal["entry"]
+    target = signal["target"]
+    stoploss = signal["stoploss"]
+    qty = signal["qty"]
+
+    ltp = fetch_ltp_with_retry(symbol)
+    if ltp is None:
+        return None
+
+    state = trade_state.get(symbol, {
+        "status": "PENDING",
+        "entry_time": None,
+        "exit_time": None,
+        "exit_price": None
+    })
+
+    # ---------------- ENTRY ----------------
+    if state["status"] == "PENDING" and ltp >= entry:
+        state["status"] = "ENTERED"
+        state["entry_time"] = now_str()
+
+    # ---------------- TARGET ----------------
+    if state["status"] == "ENTERED" and ltp >= target:
+        state["status"] = "EXITED_TARGET"
+        state["exit_time"] = now_str()
+        state["exit_price"] = target
+
+    # ---------------- STOPLOSS ----------------
+    if state["status"] == "ENTERED" and ltp <= stoploss:
+        state["status"] = "EXITED_SL"
+        state["exit_time"] = now_str()
+        state["exit_price"] = stoploss
+
+    trade_state[symbol] = state
+
+    # ---------------- P/L CALC ----------------
+    effective_price = (
+        state["exit_price"]
+        if state["status"].startswith("EXITED")
+        else ltp
     )
 
-    r = requests.get(url, headers=HEADERS, timeout=6)
-    r.raise_for_status()
-    candles = r.json().get("candles", [])
-    return candles[-1][4] if candles else None
+    pnl_per_share = round(effective_price - entry, 2)
+    pnl_pct = round((pnl_per_share / entry) * 100, 2)
 
+    capital_used = round(entry * qty, 2)
+    pnl_capital = round(pnl_per_share * qty, 2)
+    pnl_margin = round(pnl_capital * MARGIN, 2)
 
-def safe_send(chat_id, text, **kw):
-    try:
-        bot.send_message(chat_id, text, **kw)
-    except Exception as e:
-        print("Telegram error:", e)
+    return {
+        "symbol": symbol,
+        "entry": entry,
+        "ltp": round(ltp, 2),
 
-# =====================================================
-# OPTION PARSER (FINAL)
-# =====================================================
-def build_option_symbol_from_human(text):
-    """
-    Unified format for Groww (NSE + BSE):
-    <UNDERLYING><YY><M><DD><STRIKE><CE|PE>
+        "status": state["status"],
+        "entry_time": state["entry_time"],
+        "exit_price": state["exit_price"],
+        "exit_time": state["exit_time"],
 
-    Examples:
-    SENSEX 01 JAN 85400 PE -> SENSEX26010185400PE
-    NIFTY 02 FEB 25950 CE  -> NIFTY262025950CE
-    BANKNIFTY 18 OCT 44500 PE -> BANKNIFTY26101844500PE
-    """
+        "one_share_value": entry,
+        "qty": qty,
+        "capital_used": capital_used,
+        "margin_required": round(capital_used / MARGIN, 2),
 
-    parts = text.split()
-    if len(parts) != 5:
-        return None
+        "pnl_pct": pnl_pct,
+        "pnl_1_share": pnl_per_share,
+        "pnl_capital": pnl_capital,
+        "pnl_margin": pnl_margin,
 
-    underlying, day, mon, strike, opt = parts
-    opt = opt.upper()
-    mon = mon.upper()
-
-    if opt not in ("CE", "PE"):
-        return None
-
-    try:
-        day = int(day)
-        month_num = datetime.strptime(mon, "%b").month
-    except ValueError:
-        return None
-
-    today = datetime.now(IST)
-    year = today.year % 100
-
-    if month_num < today.month:
-        year += 1
-
-    return f"{underlying}{year:02d}{month_num}{day:02d}{strike}{opt}"
-
-# =====================================================
-# MONITOR THREAD
-# =====================================================
-def price_monitor_worker(chat_id, user_id, trade_symbol, display_symbol, entry_price):
-    underlying = detect_underlying(trade_symbol)
-    exchange = "BSE" if underlying in ("SENSEX", "BANKEX") else "NSE"
-
-    active_monitors[user_id] = {
-        "symbol": display_symbol,
-        "trade_symbol": trade_symbol,
-        "entry": entry_price,
-        "ltp": 0.0,
-        "status": "MONITORING",
-        "updated_at": ""
+        "updated_at": now_str()
     }
 
-    safe_send(chat_id, f"📡 Monitoring `{display_symbol}` @ {entry_price}", parse_mode="Markdown")
-
-    while not price_watchers[user_id].is_set():
+# =====================================================
+# BACKGROUND MONITOR
+# =====================================================
+def monitor_worker():
+    while True:
         try:
-            ltp = fetch_option_ltp(trade_symbol, exchange)
-        except Exception:
-            time.sleep(3)
-            continue
+            if not is_market_open():
+                time.sleep(30)
+                continue
 
-        if ltp is not None:  # ✅ CRITICAL FIX
-            active_monitors[user_id]["ltp"] = round(ltp, 2)
-            active_monitors[user_id]["updated_at"] = datetime.now(IST).strftime("%H:%M:%S")
+            doc = collection.find_one({"trade_date": today()})
+            if not doc or not doc.get("buy_signals"):
+                time.sleep(5)
+                continue
 
-            if ltp >= entry_price:
-                active_monitors[user_id]["status"] = "TRIGGERED"
-                safe_send(
-                    chat_id,
-                    f"🚨 *ENTRY HIT*\n\n{display_symbol}\nLTP: ₹{ltp:.2f}",
-                    parse_mode="Markdown"
-                )
-                break
+            signals = doc["buy_signals"]
 
-        time.sleep(2)
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = [
+                    executor.submit(process_symbol, s)
+                    for s in signals
+                ]
 
-    active_monitors[user_id]["status"] = "STOPPED"
+                for future in as_completed(futures):
+                    result = future.result()
+                    if not result:
+                        continue
 
-# =====================================================
-# /start
-# =====================================================
-def start(update, _):
-    user_state[update.effective_user.id] = {"mode": None}
-    safe_send(
-        update.effective_chat.id,
-        "👋 *Welcome*\n\n"
-        "3️⃣ Monitor Option Price\n\n"
-        "Reply with *3*\n"
-        "Send *STOP* anytime to cancel",
-        parse_mode="Markdown"
-    )
+                    with lock:
+                        live_table[result["symbol"]] = result
 
-dispatcher.add_handler(CommandHandler("start", start))
+        except Exception as e:
+            print("Monitor loop error:", e)
+
+        time.sleep(INTERVAL_SECONDS)
 
 # =====================================================
-# MESSAGE HANDLER
+# API
 # =====================================================
-def handle_message(update, _):
-    uid = update.effective_user.id
-    cid = update.effective_chat.id
-    txt = update.message.text.strip().upper()
+@app.route("/api/monitor")
+def api_monitor():
+    current_time = now_str()
 
-    if txt in ("STOP", "CANCEL"):
-        if uid in price_watchers:
-            price_watchers[uid].set()
-            safe_send(cid, "🛑 Monitoring stopped")
-        else:
-            safe_send(cid, "ℹ️ No active monitor")
-        user_state[uid] = {"mode": None}
-        return
+    # 🔹 Market closed
+    if not is_market_open():
+        msg = (
+            f"Present time: {current_time} — "
+            f"Market closed (09:15–15:30 IST)"
+        )
+        return msg, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
-    state = user_state.setdefault(uid, {"mode": None})
+    # 🔹 BUY signals not yet saved
+    doc = collection.find_one({"trade_date": today()})
+    if not doc or not doc.get("buy_signals"):
+        msg = f"Present time: {current_time} — BUY signals not yet saved"
+        return msg, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
-    if state["mode"] is None:
-        if txt == "3":
-            state["mode"] = "MONITOR"
-            state["step"] = 1
-            safe_send(
-                cid,
-                "Send option:\n"
-                "`NIFTY25DEC25950CE`\n"
-                "`SENSEX 01 JAN 85400 PE`",
-                parse_mode="Markdown"
+    # 🔹 Signals exist but prices not fetched yet
+    with lock:
+        if not live_table:
+            msg = (
+                f"Present time: {current_time} — "
+                f"BUY signals loaded, waiting for live prices"
             )
-            return
-        safe_send(cid, "Reply with *3* to start monitoring", parse_mode="Markdown")
-        return
+            return msg, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
-    if state["mode"] == "MONITOR":
-
-        if state["step"] == 1:
-            raw = txt
-
-            trade_symbol = build_option_symbol_from_human(raw) if " " in raw else raw
-            if not trade_symbol:
-                safe_send(cid, "❌ Invalid option format", parse_mode="Markdown")
-                return
-
-            state["trade_symbol"] = trade_symbol
-            state["display_symbol"] = raw
-            state["step"] = 2
-            safe_send(cid, "Send entry price (example: 345)", parse_mode="Markdown")
-            return
-
-        if state["step"] == 2:
-            try:
-                entry_price = float(txt)
-            except ValueError:
-                safe_send(cid, "❌ Invalid price. Send number like 345", parse_mode="Markdown")
-                return
-
-            price_watchers[uid] = threading.Event()
-            threading.Thread(
-                target=price_monitor_worker,
-                args=(cid, uid, state["trade_symbol"], state["display_symbol"], entry_price),
-                daemon=True
-            ).start()
-
-            user_state[uid] = {"mode": None}
-
-dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-
-# =====================================================
-# WEBHOOK
-# =====================================================
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
-    return "OK", 200
-
-# =====================================================
-# DASHBOARD API (SAFE)
-# =====================================================
-@app.route("/api/monitors")
-def api_monitors():
-    rows = []
-    for v in active_monitors.values():
-        entry = v["entry"]
-        ltp = v["ltp"]
-
-        if ltp > 0 and entry > 0:
-            pnl_pct = round(((ltp - entry) / entry) * 100, 2)
-            capital_pnl = round((pnl_pct / 100) * CAPITAL, 2)
-        else:
-            pnl_pct = 0.0
-            capital_pnl = 0.0
-
-        rows.append({
-            **v,
-            "pnl_pct": pnl_pct,
-            "capital_pnl": capital_pnl
-        })
-
-    return jsonify(rows)
+        # 🔹 Normal live data
+        return jsonify(list(live_table.values()))
 
 # =====================================================
 # DASHBOARD
@@ -301,5 +241,9 @@ def api_monitors():
 def index():
     return render_template("index.html")
 
+# =====================================================
+# START
+# =====================================================
 if __name__ == "__main__":
+    threading.Thread(target=monitor_worker, daemon=True).start()
     app.run(port=8000)
