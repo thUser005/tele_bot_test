@@ -30,12 +30,25 @@
         .badge-sl {
             background-color: #dc3545;
         }
+        .status-box {
+            background: #fff3cd;
+            border: 1px solid #ffecb5;
+            color: #664d03;
+            padding: 10px;
+            border-radius: 6px;
+            margin-bottom: 12px;
+            text-align: center;
+            font-weight: 500;
+        }
     </style>
 </head>
 <body>
 
 <div class="container-fluid mt-4">
-    <h3 class="mb-4 text-center">📊 Live BUY Breakout Monitor</h3>
+    <h3 class="mb-3 text-center">📊 Live BUY Breakout Monitor</h3>
+
+    <!-- STATUS MESSAGE -->
+    <div id="statusBox" class="status-box d-none"></div>
 
     <div class="table-responsive">
         <table class="table table-bordered table-hover align-middle text-center table-sm">
@@ -82,12 +95,25 @@ function statusBadge(status) {
 }
 
 async function loadData() {
+    const tbody = document.getElementById("tbody");
+    const statusBox = document.getElementById("statusBox");
+
     try {
         const res = await fetch("/api/monitor");
-        const data = await res.json();
+        const text = await res.text();
 
-        const tbody = document.getElementById("tbody");
+        // 🔴 PLAIN TEXT RESPONSE (market closed, waiting, etc.)
+        if (!text.trim().startsWith("[")) {
+            tbody.innerHTML = "";
+            statusBox.innerText = text;
+            statusBox.classList.remove("d-none");
+            return;
+        }
+
+        // 🟢 JSON RESPONSE
+        const data = JSON.parse(text);
         tbody.innerHTML = "";
+        statusBox.classList.add("d-none");
 
         data.forEach(r => {
             const pnlClass = r.pnl_pct >= 0 ? "profit" : "loss";
@@ -118,7 +144,10 @@ async function loadData() {
         });
 
     } catch (e) {
-        console.error("Failed to load data", e);
+        tbody.innerHTML = "";
+        statusBox.innerText = "⚠️ Unable to fetch live data";
+        statusBox.classList.remove("d-none");
+        console.error("Monitor fetch error:", e);
     }
 }
 
