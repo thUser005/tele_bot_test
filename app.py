@@ -21,7 +21,7 @@ CAPITAL = 20_000
 MARGIN = 5
 
 INTERVAL_SECONDS = 3
-MAX_WORKERS = 50
+MAX_WORKERS = 100
 MAX_RETRIES = 3
 
 IST = timezone(timedelta(hours=5, minutes=30))
