@@ -18,18 +18,6 @@
             color: #dc3545;
             font-weight: 600;
         }
-        .badge-pending {
-            background-color: #6c757d;
-        }
-        .badge-entered {
-            background-color: #198754;
-        }
-        .badge-target {
-            background-color: #0d6efd;
-        }
-        .badge-sl {
-            background-color: #dc3545;
-        }
         .status-box {
             background: #fff3cd;
             border: 1px solid #ffecb5;
@@ -45,7 +33,8 @@
 <body>
 
 <div class="container-fluid mt-4">
-    <h3 class="mb-3 text-center">📊 Live BUY Breakout Monitor</h3>
+    <h3 class="mb-1 text-center">📊 Live BUY Breakout Monitor</h3>
+    <p class="text-center text-muted mb-3" id="presentTime"></p>
 
     <!-- STATUS MESSAGE -->
     <div id="statusBox" class="status-box d-none"></div>
@@ -70,7 +59,7 @@
 
                     <th>P/L %</th>
                     <th>₹20k P/L</th>
-                    <th>5× Margin</th>
+                    <th>P/L (Margin)</th>
 
                     <th>Updated</th>
                 </tr>
@@ -85,20 +74,28 @@ let pollingHandle = null;
 
 function statusBadge(status) {
     if (status === "ENTERED") {
-        return '<span class="badge badge-entered">ENTERED</span>';
+        return '<span class="badge bg-success">ENTERED</span>';
     }
     if (status === "EXITED_TARGET") {
-        return '<span class="badge badge-target">TARGET HIT</span>';
+        return '<span class="badge bg-primary">TARGET HIT</span>';
     }
     if (status === "EXITED_SL") {
-        return '<span class="badge badge-sl">SL HIT</span>';
+        return '<span class="badge bg-danger">SL HIT</span>';
     }
-    return '<span class="badge badge-pending">WAIT</span>';
+    return '<span class="badge bg-secondary">WAIT</span>';
+}
+
+function updatePresentTime() {
+    const now = new Date();
+    document.getElementById("presentTime").innerText =
+        "Present time: " + now.toLocaleTimeString();
 }
 
 async function loadData() {
     const tbody = document.getElementById("tbody");
     const statusBox = document.getElementById("statusBox");
+
+    updatePresentTime();
 
     try {
         const res = await fetch("/api/monitor");
@@ -110,7 +107,6 @@ async function loadData() {
             statusBox.innerText = text;
             statusBox.classList.remove("d-none");
 
-            // ⛔ Stop polling after market close
             if (text.includes("Market closed") && pollingHandle) {
                 clearInterval(pollingHandle);
                 pollingHandle = null;

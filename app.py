@@ -11,6 +11,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # CONFIG
 # =====================================================
 MONGO_URI = os.getenv("MONGO_URI")
+if not MONGO_URI:
+    raise RuntimeError("❌ MONGO_URI not set")
+
 DB = "trading"
 COL = "daily_signals"
 
@@ -18,7 +21,7 @@ CAPITAL = 20_000
 MARGIN = 5
 
 INTERVAL_SECONDS = 3
-MAX_WORKERS = 100
+MAX_WORKERS = 50
 MAX_RETRIES = 3
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -64,28 +67,36 @@ def clear_live_data():
         trade_state.clear()
 
 # =====================================================
-# FETCH LTP WITH RETRY
+# FETCH LTP (ROBUST)
 # =====================================================
 def fetch_ltp_with_retry(symbol):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             end = now_ms()
-            start = end - 3 * 60 * 1000
+            start = end - 5 * 60 * 1000  # ⬅ wider window
 
             r = requests.get(
                 f"{GROWW_URL}/{symbol}",
                 params={
                     "startTimeInMillis": start,
                     "endTimeInMillis": end,
-                    "intervalInMinutes": 1
+                    "intervalInMinutes": 3  # ⬅ SAME AS STRATEGY
                 },
                 timeout=5
             )
             r.raise_for_status()
 
             candles = r.json().get("candles", [])
-            if candles:
-                return candles[-1][4]
+            if not candles:
+                return None
+
+            last = candles[-1]
+            ltp = last[4]  # close price
+
+            if ltp is None or ltp <= 0:
+                return None
+
+            return round(ltp, 2)
 
         except Exception:
             if attempt < MAX_RETRIES:
@@ -94,7 +105,7 @@ def fetch_ltp_with_retry(symbol):
     return None
 
 # =====================================================
-# PROCESS SINGLE STOCK (STATE MACHINE)
+# PROCESS SINGLE STOCK (THREAD-SAFE STATE MACHINE)
 # =====================================================
 def process_symbol(signal):
     symbol = signal["symbol"]
@@ -107,28 +118,32 @@ def process_symbol(signal):
     if ltp is None:
         return None
 
-    state = trade_state.get(symbol, {
-        "status": "PENDING",
-        "entry_time": None,
-        "exit_time": None,
-        "exit_price": None
-    })
+    with lock:
+        state = trade_state.get(symbol, {
+            "status": "PENDING",
+            "entry_time": None,
+            "exit_time": None,
+            "exit_price": None
+        })
 
-    if state["status"] == "PENDING" and ltp >= entry:
-        state["status"] = "ENTERED"
-        state["entry_time"] = now_str()
+        # ENTRY
+        if state["status"] == "PENDING" and ltp >= entry:
+            state["status"] = "ENTERED"
+            state["entry_time"] = now_str()
 
-    if state["status"] == "ENTERED" and ltp >= target:
-        state["status"] = "EXITED_TARGET"
-        state["exit_time"] = now_str()
-        state["exit_price"] = target
+        # TARGET
+        elif state["status"] == "ENTERED" and ltp >= target:
+            state["status"] = "EXITED_TARGET"
+            state["exit_time"] = now_str()
+            state["exit_price"] = target
 
-    if state["status"] == "ENTERED" and ltp <= stoploss:
-        state["status"] = "EXITED_SL"
-        state["exit_time"] = now_str()
-        state["exit_price"] = stoploss
+        # STOP LOSS
+        elif state["status"] == "ENTERED" and ltp <= stoploss:
+            state["status"] = "EXITED_SL"
+            state["exit_time"] = now_str()
+            state["exit_price"] = stoploss
 
-    trade_state[symbol] = state
+        trade_state[symbol] = state
 
     effective_price = (
         state["exit_price"]
@@ -141,12 +156,11 @@ def process_symbol(signal):
 
     capital_used = round(entry * qty, 2)
     pnl_capital = round(pnl_per_share * qty, 2)
-    pnl_margin = round(pnl_capital * MARGIN, 2)
 
     return {
         "symbol": symbol,
         "entry": entry,
-        "ltp": round(ltp, 2),
+        "ltp": ltp,
 
         "status": state["status"],
         "entry_time": state["entry_time"],
@@ -161,7 +175,7 @@ def process_symbol(signal):
         "pnl_pct": pnl_pct,
         "pnl_1_share": pnl_per_share,
         "pnl_capital": pnl_capital,
-        "pnl_margin": pnl_margin,
+        "pnl_margin": pnl_capital,  # ⚠ margin does NOT multiply PnL
 
         "updated_at": now_str()
     }
@@ -186,10 +200,7 @@ def monitor_worker():
             signals = doc["buy_signals"]
 
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                futures = [
-                    executor.submit(process_symbol, s)
-                    for s in signals
-                ]
+                futures = [executor.submit(process_symbol, s) for s in signals]
 
                 for future in as_completed(futures):
                     result = future.result()
@@ -248,4 +259,4 @@ def index():
 # =====================================================
 if __name__ == "__main__":
     threading.Thread(target=monitor_worker, daemon=True).start()
-    app.run(port=8000)
+    app.run(port=8000, debug=False)
