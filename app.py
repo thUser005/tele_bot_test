@@ -2,6 +2,7 @@ import os
 import time
 import threading
 import logging
+import requests
 from datetime import datetime, timedelta, timezone, time as dtime
 from pymongo import MongoClient
 from flask import Flask, jsonify, render_template
@@ -36,6 +37,14 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
+
+# ---- COLAB ENGINE (fallback) ----
+ENGINE_BASE_URL = os.getenv(
+    "ENGINE_BASE_URL",
+    "https://visiting-clone-bottom-tanks.trycloudflare.com"
+)
+
+ENGINE_TIMEOUT = 6  # seconds
 
 # =====================================================
 # INIT
@@ -79,6 +88,31 @@ def normalize_symbol(symbol: str) -> str:
     )
 
 # =====================================================
+# COLAB ENGINE FETCH (NEW)
+# =====================================================
+def fetch_from_engine():
+    """
+    Calls Colab engine as fallback
+    """
+    logger.info("🌐 Fetching data from Colab engine")
+
+    try:
+        r = requests.get(
+            f"{ENGINE_BASE_URL}/engine/health",
+            timeout=ENGINE_TIMEOUT
+        )
+        r.raise_for_status()
+        logger.info("✅ Engine health OK")
+    except Exception as e:
+        logger.warning(f"❌ Engine health failed: {e}")
+        return None
+
+    # NOTE:
+    # This engine does candle fetch, not BUY signals.
+    # Here we just prove connectivity.
+    return []
+
+# =====================================================
 # PROCESS SYMBOL (NO LIVE FETCH)
 # =====================================================
 def process_symbol(signal):
@@ -89,7 +123,6 @@ def process_symbol(signal):
     stoploss = signal["stoploss"]
     qty = signal["qty"]
 
-    # 🚫 NO LIVE FETCH — fallback to entry
     ltp = signal.get("ltp") or entry
 
     with lock:
@@ -99,8 +132,6 @@ def process_symbol(signal):
             "exit_time": None,
             "exit_price": None
         })
-
-        # 🚫 NO AUTO TRANSITIONS (Railway is view-only)
         trade_state[symbol] = state
 
     effective_price = (
@@ -132,7 +163,7 @@ def process_symbol(signal):
     }
 
 # =====================================================
-# BACKGROUND MONITOR (NO EXTERNAL CALLS)
+# BACKGROUND MONITOR
 # =====================================================
 def monitor_worker():
     logger.info("🚀 Monitor thread started (NO LIVE FETCH)")
@@ -145,8 +176,9 @@ def monitor_worker():
                 continue
 
             doc = collection.find_one({"trade_date": today()})
+
             if not doc or not doc.get("buy_signals"):
-                clear_live_data()
+                logger.info("ℹ️ No BUY signals in Mongo — skipping local processing")
                 time.sleep(5)
                 continue
 
@@ -194,25 +226,36 @@ start_background_monitor_once()
 @app.route("/api/monitor")
 def api_monitor():
     current_time = now_str()
+    logger.info("📡 /api/monitor called")
 
     if not is_market_open():
         clear_live_data()
         return f"Present time: {current_time} — Market closed", 200
 
     doc = collection.find_one({"trade_date": today()})
-    if not doc or not doc.get("buy_signals"):
-        clear_live_data()
-        return f"Present time: {current_time} — BUY signals not yet saved", 200
 
-    with lock:
-        if not live_table:
+    # -------- PRIMARY: Mongo + local table --------
+    if doc and doc.get("buy_signals"):
+        with lock:
+            if live_table:
+                logger.info("✅ Serving data from Railway local state")
+                return jsonify(list(live_table.values()))
+
+            logger.info("⏳ BUY signals present, waiting for engine data")
             return (
                 f"Present time: {current_time} — "
                 "BUY signals loaded, waiting for engine data",
                 200
             )
 
-        return jsonify(list(live_table.values()))
+    # -------- FALLBACK: Colab engine --------
+    logger.info("⚠️ No BUY signals — falling back to Colab engine")
+    engine_data = fetch_from_engine()
+
+    if engine_data is None:
+        return f"Present time: {current_time} — Engine unreachable", 200
+
+    return f"Present time: {current_time} — Engine connected (no BUY data)", 200
 
 # =====================================================
 # DASHBOARD
