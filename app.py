@@ -232,19 +232,26 @@ def monitor_worker():
         time.sleep(INTERVAL_SECONDS)
 
 # =====================================================
-# START MONITOR (GUNICORN SAFE)
+# START BACKGROUND MONITOR (FLASK 3 + GUNICORN SAFE)
 # =====================================================
-@app.before_first_request
-def start_monitor():
+
+def start_background_monitor_once():
     global monitor_started
-    if not monitor_started:
-        logger.info("🚀 Starting background monitor")
-        threading.Thread(
-            target=monitor_worker,
-            daemon=True,
-            name="MonitorThread"
-        ).start()
-        monitor_started = True
+    if monitor_started:
+        return
+
+    logger.info("🚀 Starting background monitor (Flask 3 safe)")
+    t = threading.Thread(
+        target=monitor_worker,
+        daemon=True,
+        name="MonitorThread"
+    )
+    t.start()
+    monitor_started = True
+
+
+# Start immediately on import (Gunicorn-safe with 1 worker)
+start_background_monitor_once()
 
 # =====================================================
 # API
