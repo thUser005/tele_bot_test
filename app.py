@@ -31,7 +31,7 @@ CAPITAL = 20_000
 MARGIN = 5
 
 INTERVAL_SECONDS = 3
-MAX_WORKERS = 10
+MAX_WORKERS = 100
 MAX_RETRIES = 3
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -48,6 +48,7 @@ GROWW_URL = (
 # INIT
 # =====================================================
 app = Flask(__name__)
+
 client = MongoClient(MONGO_URI)
 collection = client[DB][COL]
 
@@ -55,7 +56,7 @@ live_table = {}
 trade_state = {}
 lock = threading.Lock()
 
-monitor_started = False  # 🔐 critical for Gunicorn
+monitor_started = False  # guarded start flag
 
 # =====================================================
 # UTILS
@@ -70,8 +71,7 @@ def now_str():
     return datetime.now(IST).strftime("%H:%M:%S")
 
 def is_market_open():
-    now = datetime.now(IST).time()
-    return MARKET_OPEN <= now <= MARKET_CLOSE
+    return MARKET_OPEN <= datetime.now(IST).time() <= MARKET_CLOSE
 
 def clear_live_data():
     with lock:
@@ -81,8 +81,7 @@ def clear_live_data():
 
 def normalize_symbol(symbol: str) -> str:
     return (
-        symbol
-        .replace("NSE:", "")
+        symbol.replace("NSE:", "")
         .replace(".NS", "")
         .replace("-EQ", "")
         .strip()
@@ -99,8 +98,6 @@ def fetch_ltp_with_retry(symbol):
         try:
             end = now_ms()
             start = end - 5 * 60 * 1000
-
-            logger.debug(f"📡 Groww API | {symbol} | Attempt {attempt}")
 
             r = requests.get(
                 f"{GROWW_URL}/{symbol}",
@@ -175,7 +172,12 @@ def process_symbol(signal):
 
         trade_state[symbol] = state
 
-    effective_price = state["exit_price"] if state["status"].startswith("EXITED") else ltp
+    effective_price = (
+        state["exit_price"]
+        if state["status"].startswith("EXITED")
+        else ltp
+    )
+
     pnl = round((effective_price - entry) * qty, 2)
     pnl_pct = round((effective_price - entry) / entry * 100, 2)
     capital_used = round(entry * qty, 2)
@@ -219,12 +221,17 @@ def monitor_worker():
 
             signals = doc["buy_signals"]
 
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-                for f in as_completed(ex.submit(process_symbol, s) for s in signals):
-                    res = f.result()
-                    if res:
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = [
+                    executor.submit(process_symbol, s)
+                    for s in signals
+                ]
+
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result:
                         with lock:
-                            live_table[res["symbol"]] = res
+                            live_table[result["symbol"]] = result
 
         except Exception:
             logger.exception("🔥 Monitor crashed")
@@ -234,23 +241,21 @@ def monitor_worker():
 # =====================================================
 # START BACKGROUND MONITOR (FLASK 3 + GUNICORN SAFE)
 # =====================================================
-
 def start_background_monitor_once():
     global monitor_started
-    if monitor_started:
-        return
+    with lock:
+        if monitor_started:
+            return
+        monitor_started = True
 
     logger.info("🚀 Starting background monitor (Flask 3 safe)")
-    t = threading.Thread(
+    threading.Thread(
         target=monitor_worker,
         daemon=True,
         name="MonitorThread"
-    )
-    t.start()
-    monitor_started = True
+    ).start()
 
-
-# Start immediately on import (Gunicorn-safe with 1 worker)
+# Start immediately on import
 start_background_monitor_once()
 
 # =====================================================
@@ -271,7 +276,11 @@ def api_monitor():
 
     with lock:
         if not live_table:
-            return f"Present time: {current_time} — BUY signals loaded, waiting for live prices", 200
+            return (
+                f"Present time: {current_time} — "
+                "BUY signals loaded, waiting for live prices",
+                200
+            )
 
         return jsonify(list(live_table.values()))
 
