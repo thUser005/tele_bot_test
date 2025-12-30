@@ -36,7 +36,6 @@
     <h3 class="mb-1 text-center">📊 Live BUY Breakout Monitor</h3>
     <p class="text-center text-muted mb-3" id="presentTime"></p>
 
-    <!-- STATUS MESSAGE -->
     <div id="statusBox" class="status-box d-none"></div>
 
     <div class="table-responsive">
@@ -46,21 +45,17 @@
                     <th>Symbol</th>
                     <th>Entry</th>
                     <th>LTP</th>
-
                     <th>Status</th>
                     <th>Entry Time</th>
                     <th>Exit Price</th>
                     <th>Exit Time</th>
-
                     <th>1 Share ₹</th>
                     <th>Qty @ ₹20k</th>
                     <th>Capital Used</th>
                     <th>Margin Req (5×)</th>
-
                     <th>P/L %</th>
                     <th>₹20k P/L</th>
                     <th>P/L (Margin)</th>
-
                     <th>Updated</th>
                 </tr>
             </thead>
@@ -72,6 +67,7 @@
 <script>
 let pollingHandle = null;
 
+// ================= STATUS BADGE =================
 function statusBadge(status) {
     if (status === "ENTERED") {
         return '<span class="badge bg-success">ENTERED</span>';
@@ -85,12 +81,23 @@ function statusBadge(status) {
     return '<span class="badge bg-secondary">WAIT</span>';
 }
 
+// ================= TIME =================
 function updatePresentTime() {
     const now = new Date();
     document.getElementById("presentTime").innerText =
         "Present time: " + now.toLocaleTimeString();
 }
 
+// ================= SORT PRIORITY =================
+const STATUS_PRIORITY = {
+    "EXITED_TARGET": 3,
+    "EXITED_SL": 3,
+    "ENTERED": 2,
+    "PENDING": 1,
+    "WAIT": 1
+};
+
+// ================= LOAD DATA =================
 async function loadData() {
     const tbody = document.getElementById("tbody");
     const statusBox = document.getElementById("statusBox");
@@ -101,7 +108,7 @@ async function loadData() {
         const res = await fetch("/api/monitor");
         const text = await res.text();
 
-        // 🔴 Plain text response (market closed / waiting)
+        // TEXT RESPONSE
         if (!text.trim().startsWith("[")) {
             tbody.innerHTML = "";
             statusBox.innerText = text;
@@ -110,16 +117,36 @@ async function loadData() {
             if (text.includes("Market closed") && pollingHandle) {
                 clearInterval(pollingHandle);
                 pollingHandle = null;
-                console.log("🛑 Polling stopped — market closed");
             }
             return;
         }
 
-        // 🟢 JSON data
+        // JSON RESPONSE
         const data = JSON.parse(text);
         tbody.innerHTML = "";
         statusBox.classList.add("d-none");
 
+        // ================= SORT =================
+        data.sort((a, b) => {
+            // 1️⃣ Status priority (HIT first)
+            const pA = STATUS_PRIORITY[a.status] || 0;
+            const pB = STATUS_PRIORITY[b.status] || 0;
+            if (pA !== pB) return pB - pA;
+
+            // 2️⃣ Symbol A → Z
+            if (typeof a.symbol === "string" && typeof b.symbol === "string") {
+                return a.symbol.localeCompare(b.symbol);
+            }
+
+            // 3️⃣ Numeric fallback (LTP desc)
+            if (!isNaN(a.ltp) && !isNaN(b.ltp)) {
+                return b.ltp - a.ltp;
+            }
+
+            return 0;
+        });
+
+        // ================= RENDER =================
         data.forEach(r => {
             const pnlClass = r.pnl_pct >= 0 ? "profit" : "loss";
 
@@ -156,7 +183,7 @@ async function loadData() {
     }
 }
 
-// ▶ Start polling
+// ================= START POLLING =================
 pollingHandle = setInterval(loadData, 3000);
 loadData();
 </script>

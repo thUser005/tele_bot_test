@@ -1,7 +1,6 @@
 import os
 import time
 import threading
-import requests
 import logging
 from datetime import datetime, timedelta, timezone, time as dtime
 from pymongo import MongoClient
@@ -32,17 +31,11 @@ MARGIN = 5
 
 INTERVAL_SECONDS = 3
 MAX_WORKERS = 20
-MAX_RETRIES = 3
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
 MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
-
-GROWW_URL = (
-    "https://groww.in/v1/api/charting_service/v2/chart/"
-    "delayed/exchange/NSE/segment/CASH"
-)
 
 # =====================================================
 # INIT
@@ -56,16 +49,13 @@ live_table = {}
 trade_state = {}
 lock = threading.Lock()
 
-monitor_started = False  # guarded start flag
+monitor_started = False
 
 # =====================================================
 # UTILS
 # =====================================================
 def today():
     return datetime.now(IST).strftime("%Y-%m-%d")
-
-def now_ms():
-    return int(datetime.now(IST).timestamp() * 1000)
 
 def now_str():
     return datetime.now(IST).strftime("%H:%M:%S")
@@ -89,61 +79,18 @@ def normalize_symbol(symbol: str) -> str:
     )
 
 # =====================================================
-# FETCH LTP
-# =====================================================
-def fetch_ltp_with_retry(symbol):
-    symbol = normalize_symbol(symbol)
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            end = now_ms()
-            start = end - 5 * 60 * 1000
-
-            r = requests.get(
-                f"{GROWW_URL}/{symbol}",
-                params={
-                    "startTimeInMillis": start,
-                    "endTimeInMillis": end,
-                    "intervalInMinutes": 3
-                },
-                timeout=5
-            )
-            r.raise_for_status()
-
-            candles = r.json().get("candles", [])
-            if not candles:
-                logger.warning(f"⚠️ No candles | {symbol}")
-                return None
-
-            ltp = candles[-1][4]
-            if not ltp or ltp <= 0:
-                logger.warning(f"⚠️ Invalid LTP | {symbol}")
-                return None
-
-            return round(ltp, 2)
-
-        except requests.Timeout:
-            logger.warning(f"⏱ Timeout | {symbol}")
-        except Exception:
-            logger.exception(f"🔥 LTP error | {symbol}")
-
-        time.sleep(0.4)
-
-    return None
-
-# =====================================================
-# PROCESS SYMBOL
+# PROCESS SYMBOL (NO LIVE FETCH)
 # =====================================================
 def process_symbol(signal):
     symbol = normalize_symbol(signal["symbol"])
+
     entry = signal["entry"]
     target = signal["target"]
     stoploss = signal["stoploss"]
     qty = signal["qty"]
 
-    ltp = fetch_ltp_with_retry(symbol)
-    if ltp is None:
-        return None
+    # 🚫 NO LIVE FETCH — fallback to entry
+    ltp = signal.get("ltp") or entry
 
     with lock:
         state = trade_state.get(symbol, {
@@ -153,23 +100,7 @@ def process_symbol(signal):
             "exit_price": None
         })
 
-        if state["status"] == "PENDING" and ltp >= entry:
-            state["status"] = "ENTERED"
-            state["entry_time"] = now_str()
-            logger.info(f"🟢 ENTERED | {symbol}")
-
-        elif state["status"] == "ENTERED" and ltp >= target:
-            state["status"] = "EXITED_TARGET"
-            state["exit_time"] = now_str()
-            state["exit_price"] = target
-            logger.info(f"🎯 TARGET | {symbol}")
-
-        elif state["status"] == "ENTERED" and ltp <= stoploss:
-            state["status"] = "EXITED_SL"
-            state["exit_time"] = now_str()
-            state["exit_price"] = stoploss
-            logger.info(f"🔴 SL | {symbol}")
-
+        # 🚫 NO AUTO TRANSITIONS (Railway is view-only)
         trade_state[symbol] = state
 
     effective_price = (
@@ -201,10 +132,10 @@ def process_symbol(signal):
     }
 
 # =====================================================
-# BACKGROUND MONITOR
+# BACKGROUND MONITOR (NO EXTERNAL CALLS)
 # =====================================================
 def monitor_worker():
-    logger.info("🚀 Monitor thread started")
+    logger.info("🚀 Monitor thread started (NO LIVE FETCH)")
 
     while True:
         try:
@@ -239,7 +170,7 @@ def monitor_worker():
         time.sleep(INTERVAL_SECONDS)
 
 # =====================================================
-# START BACKGROUND MONITOR (FLASK 3 + GUNICORN SAFE)
+# START BACKGROUND MONITOR
 # =====================================================
 def start_background_monitor_once():
     global monitor_started
@@ -248,14 +179,13 @@ def start_background_monitor_once():
             return
         monitor_started = True
 
-    logger.info("🚀 Starting background monitor (Flask 3 safe)")
+    logger.info("🚀 Starting background monitor (Railway-safe)")
     threading.Thread(
         target=monitor_worker,
         daemon=True,
         name="MonitorThread"
     ).start()
 
-# Start immediately on import
 start_background_monitor_once()
 
 # =====================================================
@@ -278,7 +208,7 @@ def api_monitor():
         if not live_table:
             return (
                 f"Present time: {current_time} — "
-                "BUY signals loaded, waiting for live prices",
+                "BUY signals loaded, waiting for engine data",
                 200
             )
 
