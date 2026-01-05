@@ -1,6 +1,34 @@
+# =========================
+# Web / Server
+# =========================
 flask
 gunicorn
+
+# =========================
+# HTTP / Parsing
+# =========================
 requests
-pymongo
-python-telegram-bot==13.15
 beautifulsoup4
+
+# =========================
+# Database
+# =========================
+pymongo
+
+# =========================
+# Telegram Bot
+# =========================
+python-telegram-bot
+
+# =========================
+# Upstox API (CRITICAL)
+# =========================
+upstox-python
+urllib3
+websocket-client
+
+# =========================
+# Environment & Time
+# =========================
+python-dotenv
+pytz
