@@ -6,6 +6,7 @@ import platform
 import subprocess
 import threading
 import shutil
+import concurrent.futures
 from datetime import datetime, time
 import pytz
 
@@ -29,6 +30,9 @@ from get_bal import fetch_balance
 from fetch_ltp import fetch_ltp
 from place_order import place_partial_runner_gtt
 
+# ✅ NEW IMPORT (ONLY ADDITION)
+from check_upstox_token import check_upstox_access_token
+
 # ================================
 # CONFIG
 # ================================
@@ -44,27 +48,18 @@ LOCAL_SERVER_PORT = 8000   # for tunnel
 # ENVIRONMENT DETECTION
 # ================================
 def is_colab_or_linux():
-    """
-    Detects Google Colab or Linux cloud environments
-    """
-    if os.path.exists("/content"):   # Google Colab
+    if os.path.exists("/content"):
         return True
-
     if platform.system().lower() == "linux":
         return True
-
     return False
 
 # ================================
 # CLOUDFARE TUNNEL (LINUX ONLY)
 # ================================
 def start_cloudflare_tunnel(local_port=8000):
-    """
-    Starts Cloudflare tunnel in background (non-blocking)
-    """
     if shutil.which("cloudflared") is None:
         print("⏳ Installing cloudflared...")
-
         subprocess.run(
             [
                 "curl", "-fsSL",
@@ -96,10 +91,6 @@ def now_ist():
 
 
 def is_upstox_service_open():
-    """
-    Upstox trading + funds services:
-    05:30 AM – 11:59 PM IST
-    """
     now = datetime.now(IST).time()
     return time(5, 30) <= now <= time(23, 59)
 
@@ -303,6 +294,19 @@ async def print_bot_info(app):
     print("========================================")
 
 # ================================
+# PREFLIGHT CHECKS (PARALLEL)
+# ================================
+def run_preflight_checks():
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(ensure_instrument_master_ready)
+        f2 = executor.submit(check_upstox_access_token)
+
+        return {
+            "instrument": f1.result(),
+            "token": f2.result(),
+        }
+
+# ================================
 # MAIN (OS AWARE)
 # ================================
 def main():
@@ -310,11 +314,22 @@ def main():
         print("❌ TELEGRAM_BOT_TOKEN missing")
         return
 
-    print("🔍 Verifying instrument master...")
-    if not ensure_instrument_master_ready():
+    print("🚦 Running startup checks...")
+    checks = run_preflight_checks()
+
+    if not checks["instrument"]:
         print("❌ Instrument master NOT ready. Bot stopped.")
         return
     print("✅ Instrument master ready")
+
+    token_status = checks["token"]
+    if token_status["status"] != "VALID":
+        print("❌ Upstox token issue")
+        print(f"Status     : {token_status['status']}")
+        print(f"Checked At : {token_status['checked_at']}")
+        print("🛑 Bot startup aborted")
+        return
+    print("✅ Upstox access token is VALID")
 
     if is_colab_or_linux():
         print("☁️ Colab / Linux detected → starting Cloudflare tunnel")
